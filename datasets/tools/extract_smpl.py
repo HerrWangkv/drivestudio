@@ -11,6 +11,7 @@ import hydra
 import joblib
 import numpy as np
 import torch
+import shutil
 from hydra.core.config_store import ConfigStore
 from hydra.core.global_hydra import GlobalHydra
 
@@ -146,6 +147,13 @@ class HMR2023TextureSampler(HMR2Predictor):
 
 class HMR2_4dhuman(PHALP):
     def __init__(self, cfg):
+        smpl_path = os.path.join(CACHE_DIR, "phalp/3D/models/smpl/SMPL_NEUTRAL.pkl")
+        if not os.path.exists(smpl_path):
+            if not os.path.exists("smpl_models/SMPL_NEUTRAL.pkl"):
+                raise FileNotFoundError("SMPL model not found.")
+            else:
+                os.makedirs(os.path.dirname(smpl_path), exist_ok=True)
+                shutil.copyfile("smpl_models/SMPL_NEUTRAL.pkl", smpl_path)
         super().__init__(cfg)
 
     def setup_hmr(self):

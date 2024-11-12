@@ -57,7 +57,7 @@ Supported datasets for human body pose extraction:
    conda activate 4D-humans
 
    # Install PyTorch
-   pip install torch
+   pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 
    # Install 4D-Humans
    cd third_party/Humans4D
