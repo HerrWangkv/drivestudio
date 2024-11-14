@@ -177,8 +177,12 @@ def main(args):
     cfg = OmegaConf.merge(cfg, OmegaConf.from_cli(args.opts))
     cfg.log_dir = log_dir
     args.enable_wandb = False
-    for folder in ["videos_eval", "metrics_eval"]:
-        os.makedirs(os.path.join(log_dir, folder), exist_ok=True)
+    if args.render_video_postfix is None:
+        for folder in ["videos_eval", "metrics_eval"]:
+            os.makedirs(os.path.join(log_dir, folder), exist_ok=True)
+    else:
+        for folder in [f"videos_{args.render_video_postfix}", f"metrics_{args.render_video_postfix}"]:
+            os.makedirs(os.path.join(log_dir, folder), exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # build dataset
@@ -242,7 +246,7 @@ def main(args):
         dataset=dataset,
         render_keys=render_keys,
         args=args,
-        post_fix="_eval"
+        post_fix="_eval" if args.render_video_postfix is None else f"_{args.render_video_postfix}",
     )
     
     if args.enable_viewer:
