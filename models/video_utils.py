@@ -48,7 +48,8 @@ def render_images(
     dataset: SplitWrapper,
     compute_metrics: bool = False,
     compute_error_map: bool = False,
-    vis_indices: Optional[List[int]] = None
+    vis_indices: Optional[List[int]] = None,
+    render_objects: bool = False,
 ):
     """
     Render pixel-related outputs from a model.
@@ -90,6 +91,7 @@ def render(
     compute_metrics: bool = False,
     compute_error_map: bool = False,
     vis_indices: Optional[List[int]] = None,
+    render_objects: bool = False,
 ):
     """
     Renders a dataset utilizing a specified render function.
@@ -105,6 +107,7 @@ def render(
     rgbs, gt_rgbs, rgb_sky_blend, rgb_sky = [], [], [], []
     Background_rgbs, RigidNodes_rgbs, DeformableNodes_rgbs, SMPLNodes_rgbs, Dynamic_rgbs = [], [], [], [], []
     error_maps = []
+    Object_rgbs = []
 
     # depths
     depths, lidar_on_images = [], []
@@ -130,6 +133,14 @@ def render(
         for i in tqdm(indices, desc=f"rendering {dataset.split}", dynamic_ncols=True):
             # get image and camera infos
             image_infos, cam_infos = dataset.get_image(i, camera_downscale)
+            if render_objects:
+                frame_idx = int(image_infos['frame_idx'][0,0])
+                instance_pose = dataset.datasource.instances_pose[frame_idx] # [M, 4, 4]
+                instance_size = dataset.datasource.instances_size # [M, 3]
+                valid_instance = instance_pose[:,-1,-1] != 0
+                instance_pose = instance_pose[valid_instance]
+                instance_size = instance_size[valid_instance]
+            
             for k, v in image_infos.items():
                 if isinstance(v, Tensor):
                     image_infos[k] = v.cuda(non_blocking=True)
@@ -137,7 +148,10 @@ def render(
                 if isinstance(v, Tensor):
                     cam_infos[k] = v.cuda(non_blocking=True)
             # render the image
-            results = trainer(image_infos, cam_infos)
+            if render_objects:
+                results = trainer(image_infos, cam_infos, instance_pose=instance_pose, instance_size=instance_size)
+            else:
+                results = trainer(image_infos, cam_infos)
             
             # ------------- clip rgb ------------- #
             for k, v in results.items():
@@ -183,6 +197,11 @@ def render(
                     "Dynamic_opacity"
                 ] + green_background * (1 - results["Dynamic_opacity"])
                 Dynamic_rgbs.append(get_numpy(Dynamic_rgb))
+            if "Object_rgb" in results:
+                Object_rgb = results["Object_rgb"] * results[
+                    "Object_opacity"
+                ] + green_background * (1 - results["Object_opacity"])
+                Object_rgbs.append(get_numpy(Object_rgb))
             if compute_error_map:
                 # cal mean squared error
                 error_map = (rgb - image_infos["pixels"]) ** 2
@@ -358,6 +377,8 @@ def render(
         results_dict["SMPLNodes_rgbs"] = SMPLNodes_rgbs
     if len(Dynamic_rgbs) > 0:
         results_dict["Dynamic_rgbs"] = Dynamic_rgbs
+    if len(Object_rgbs) > 0:
+        results_dict["Object_rgbs"] = Object_rgbs
     if len(Background_depths) > 0:
         results_dict["Background_depths"] = Background_depths
     if len(RigidNodes_depths) > 0:

@@ -98,6 +98,7 @@ def do_evaluation(
             dataset=dataset.full_image_set,
             compute_metrics=True,
             compute_error_map=cfg.render.vis_error,
+            #render_objects=True
         )
         
         if log_metrics:
@@ -174,6 +175,7 @@ def main(args):
     log_dir = os.path.dirname(args.resume_from)
     cfg = OmegaConf.load(os.path.join(log_dir, "config.yaml"))
     cfg = OmegaConf.merge(cfg, OmegaConf.from_cli(args.opts))
+    cfg.log_dir = log_dir
     args.enable_wandb = False
     for folder in ["videos_eval", "metrics_eval"]:
         os.makedirs(os.path.join(log_dir, folder), exist_ok=True)
@@ -220,7 +222,8 @@ def main(args):
         # "RigidNodes_depths",
         # "DeformableNodes_depths",
         # "SMPLNodes_depths",
-        # "mask"
+        # "mask",
+        #"Object_rgbs",
     ]
     if cfg.render.vis_lidar:
         render_keys.insert(0, "lidar_on_images")

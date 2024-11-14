@@ -196,7 +196,9 @@ class MultiTrainer(BasicTrainer):
         self, 
         image_infos: Dict[str, torch.Tensor],
         camera_infos: Dict[str, torch.Tensor],
-        novel_view: bool = False
+        novel_view: bool = False,
+        instance_pose: torch.Tensor = None,
+        instance_size: torch.Tensor = None,
     ) -> Dict[str, torch.Tensor]:
         """Forward pass of the model
 
@@ -236,7 +238,10 @@ class MultiTrainer(BasicTrainer):
             cam=processed_cam,
             image_ids=image_infos["img_idx"].flatten()[0]
         )
-
+        if instance_pose is not None and instance_size is not None:
+            self.object_mask = is_inside(gs._means, instance_pose, instance_size)
+        else:
+            self.object_mask = None
         # render gaussians
         outputs, render_fn = self.render_gaussians(
             gs=gs,
@@ -265,6 +270,11 @@ class MultiTrainer(BasicTrainer):
                     outputs[class_name+"_rgb"] = self.affine_transformation(sep_rgb, image_infos)
                     outputs[class_name+"_opacity"] = sep_opacity
                     outputs[class_name+"_depth"] = sep_depth
+                if self.object_mask is not None:
+                    object_rgb, object_depth, object_opacity = render_fn(self.object_mask)
+                    outputs["Object_rgb"] = self.affine_transformation(object_rgb, image_infos)
+                    outputs["Object_opacity"] = object_opacity
+                    outputs["Object_depth"] = object_depth
 
         if not self.training or self.render_dynamic_mask:
             with torch.no_grad():
@@ -294,3 +304,29 @@ class MultiTrainer(BasicTrainer):
         metric_dict = super().compute_metrics(outputs, image_infos)
         
         return metric_dict
+    
+
+def is_inside(points, instance_pose, instance_size):
+    # points: [N, 3]
+    # instance_pose: [M, 4, 4]
+    # instance_size: [M, 3]
+    # return: [N]
+    N = points.shape[0]
+    M = instance_pose.shape[0]
+    R = instance_pose[:, :3, :3] # [M, 3, 3]
+    T = instance_pose[:, :3, 3] # [M, 3]
+    R_inv = R.transpose(1, 2) # [M, 3, 3]
+    T_inv = -torch.matmul(R_inv, T.unsqueeze(-1)).squeeze(-1) # [M, 3]
+    inv_instance_pose = torch.cat([R_inv, T_inv.unsqueeze(-1)], dim=-1) # [M, 3, 4]
+    inv_instance_pose = torch.cat([inv_instance_pose, torch.tensor([0, 0, 0, 1], dtype=torch.float32).unsqueeze(0).expand(M, -1, -1).to(inv_instance_pose.device)], dim=1) # [M, 4, 4]
+    points = points.unsqueeze(1).expand(-1, M, -1).cuda() # [N, M, 3]
+    instance_size = instance_size.unsqueeze(0).expand(N, -1, -1).cuda() # [N, M, 3]
+    inv_instance_pose = inv_instance_pose.unsqueeze(0).expand(N, -1, -1, -1).cuda() # [N, M, 4, 4]
+    transformed_points = torch.cat([points, torch.ones(N, M, 1).to(points.device)], dim=-1) # [N, M, 4]
+    transformed_points = torch.matmul(inv_instance_pose, transformed_points.unsqueeze(-1)).squeeze(-1) # [N, M, 4]
+    transformed_points = transformed_points[..., :3] # [N, M, 3]
+    transformed_points = torch.abs(transformed_points) # [N, M, 3]
+    is_inside = (transformed_points < instance_size).all(dim=-1) # [N, M]
+    is_inside = is_inside.any(dim=-1) # [N]
+    print(is_inside.shape[0], int(is_inside.sum()), is_inside.sum()/is_inside.shape[0])
+    return is_inside
