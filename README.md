@@ -108,7 +108,10 @@ cd drivestudio
 conda create -n drivestudio python=3.9 -y
 conda activate drivestudio
 pip install -r requirements.txt
-pip install git+https://github.com/nerfstudio-project/gsplat.git@v1.3.0
+git submodule update --init --recursive
+cd third_party/gsplat
+pip install -e .
+cd ../..
 pip install git+https://github.com/facebookresearch/pytorch3d.git
 pip install git+https://github.com/NVlabs/nvdiffrast
 
