@@ -228,7 +228,7 @@ class NuScenesProcessor(object):
             print(f"Processed objects for scene {str(scene_idx).zfill(3)}")
             
             # interpolate the instances info
-            instances_info, frame_instances = self.interpolate_boxes(instances_info)
+            instances_info, frame_instances = self.interpolate_boxes(instances_info, max_frame_idx=(scene_data['nbr_samples'] - 1) * (self.interpolate_N + 1) + 1)
             print(f"Interpolated objects for scene {str(scene_idx).zfill(3)}")
             
             # Save instances info and frame instances
@@ -848,10 +848,13 @@ class NuScenesProcessor(object):
         new_frame_instances = {}
         for k, v in frame_instances.items():
             new_frame_instances[k] = [id_map[i] for i in v]
+        for k in range(key_frame_idx * self.interpolate_N + 1):
+            if k not in new_frame_instances:
+                new_frame_instances[k] = []
 
         return new_instances_info, new_frame_instances
     
-    def interpolate_boxes(self, instances_info):
+    def interpolate_boxes(self, instances_info, max_frame_idx):
         """Interpolate object positions and sizes between keyframes."""
         new_instances_info = {}
         new_frame_instances = {}
@@ -919,6 +922,9 @@ class NuScenesProcessor(object):
                     new_frame_instances[frame] = []
                 new_frame_instances[frame].append(obj_id)
 
+        for k in range(max_frame_idx):
+            if k not in new_frame_instances:
+                new_frame_instances[k] = []
         return new_instances_info, new_frame_instances
 
     def visualize_dynamic_objects(self, scene_data, scene_idx, instances_info, frame_instances):
