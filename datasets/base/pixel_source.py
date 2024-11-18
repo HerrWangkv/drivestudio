@@ -137,8 +137,14 @@ class CameraData(object):
         self.load_egocar_mask()
         if load_dynamic_mask:
             self.load_dynamic_masks()
+        else:
+            self.dynamic_masks = None
+            self.human_masks = None
+            self.vehicle_masks = None
         if load_sky_mask:
             self.load_sky_masks()
+        else:
+            self.sky_masks = None
         self.lidar_depth_maps = None # will be loaded by: self.load_depth()
         self.image_error_maps = None # will be built by: self.build_image_error_buffer()
         self.to(self.device)
