@@ -158,6 +158,17 @@ class dataclass_gs:
             return self._quats.detach()
         else:
             return self._quats
+
+    def __getitem__(self, mask):
+        return dataclass_gs(
+            _opacities=self._opacities[mask],
+            _means=self._means[mask],
+            _rgbs=self._rgbs[mask],
+            _scales=self._scales[mask],
+            _quats=self._quats[mask],
+            detach_keys=self.detach_keys,
+            extras={k: v[mask] for k, v in self.extras.items()} if self.extras else None,
+        )
         
 def remove_from_optim(optimizer, deleted_mask, param_dict):
     """removes the deleted_mask from the optimizer provided"""

@@ -8,7 +8,7 @@ import numpy as np
 from torch import nn, Tensor
 from tqdm import tqdm, trange
 from omegaconf import OmegaConf
-from gsplat.rendering import rasterization
+from gsplat_utils import rasterization, prune 
 
 from utils.misc import import_str
 from utils.visualization import to8b, get_layout
@@ -84,7 +84,10 @@ class Dataset:
         return self.full_image_set.get_image(idx, camera_downscale=1.0)
     
 class Model:
-    def __init__(self, cfg, dataset):
+    def __init__(self, cfg, dataset, threshold):
+        self.threshold = threshold
+        print(f"Pruning threshold: {self.threshold}")
+        self.prune_or_not = True if self.threshold > 0 else False
         self.model_config = cfg.model
         self.render_cfg = cfg.trainer.render
         self.gaussian_optim_general_cfg = cfg.trainer.gaussian_optim_general_cfg
@@ -94,6 +97,8 @@ class Model:
         self.num_timesteps = dataset.num_img_timesteps
         self.num_train_images = len(dataset.full_image_set)
         self.num_full_images = len(dataset.full_image_set)
+        self.num_gs_points = 0
+        self.max_num_per_frame = 0
         
         # init scene scale
         self._init_scene(scene_aabb=dataset.aabb)
@@ -287,6 +292,31 @@ class Model:
         
         return gaussians
     
+    def prune_gaussians(
+        self,
+        gs: dataclass_gs,
+        cam: dataclass_camera,
+        **kwargs,
+    ):
+        gs_mask = prune(
+                threshold=self.threshold,
+                means=gs.means,
+                quats=gs.quats,
+                scales=gs.scales,
+                opacities=gs.opacities.squeeze(),
+                colors=gs.rgbs,
+                viewmats=torch.linalg.inv(cam.camtoworlds)[None, ...],  # [C, 4, 4]
+                Ks=cam.Ks[None, ...],  # [C, 3, 3]
+                width=cam.W,
+                height=cam.H,
+                packed=self.render_cfg.packed,
+                absgrad=self.render_cfg.absgrad,
+                sparse_grad=self.render_cfg.sparse_grad,
+                rasterize_mode="antialiased" if self.render_cfg.antialiased else "classic",
+                **kwargs,
+            )
+        return gs_mask
+
     def affine_transformation(
         self,
         rgb_blended,
@@ -371,9 +401,19 @@ class Model:
             cam=processed_cam,
             image_ids=image_infos["img_idx"].flatten()[0]
         )
+        if self.prune_or_not:
+            gs_mask = self.prune_gaussians(
+                gs=gs,
+                cam=processed_cam,
+                near_plane=self.render_cfg.near_plane,
+                far_plane=self.render_cfg.far_plane,
+                radius_clip=self.render_cfg.get('radius_clip', 0.)
+            )
+        else:
+            gs_mask = torch.ones_like(gs.means[:, 0], dtype=torch.bool)
         # render gaussians
         outputs = self.render_gaussians(
-            gs=gs,
+            gs=gs[gs_mask],
             cam=processed_cam,
             near_plane=self.render_cfg.near_plane,
             far_plane=self.render_cfg.far_plane,
@@ -383,7 +423,7 @@ class Model:
         ret = self.affine_transformation(
             outputs["rgb_gaussians"], image_infos
         )
-        return ret.cpu().numpy(), camera_infos["cam_name"]
+        return ret.cpu().numpy(), camera_infos["cam_name"], gs_mask
 
     def save_videos(
         self,
@@ -401,17 +441,26 @@ class Model:
             merged_list = []
             rgbs = []
             cam_names = []
+            mask = None
             for j in range(num_cams):
                 with torch.no_grad():
-                    rgb, cam_name = self.render(i*num_cams+j)
+                    rgb, cam_name, gs_mask = self.render(i*num_cams+j)
+                    mask = gs_mask if mask is None else torch.logical_or(mask, gs_mask)
+                    if self.num_gs_points == 0:
+                        self.num_gs_points = len(mask)
+                    else:
+                        assert self.num_gs_points == len(mask), "Number of points in the mask is not consistent"
                 rgbs.append(rgb)
                 cam_names.append(cam_name)
+            self.max_num_per_frame = max(self.max_num_per_frame, int(mask.sum()))
             tiled_img = self.dataset.layout(rgbs, cam_names)    
             merged_list.append(tiled_img)
             merged_frame = to8b(np.concatenate(merged_list, axis=0))
             writer.append_data(merged_frame)
         writer.close()
         del rgbs, cam_names
+        print(f"Overall number of points            : {self.num_gs_points}")
+        print(f"Maximum number of points per frame  : {self.max_num_per_frame}")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Render from checkpoint")
@@ -428,6 +477,6 @@ if __name__ == "__main__":
     print(f"Loading config from {config_path}")
     cfg = OmegaConf.load(config_path)
     dataset = Dataset(cfg.data)
-    model = Model(cfg, dataset)
+    model = Model(cfg, dataset, threshold=0.1)
     model.resume_from_checkpoint(model_path)
     model.save_videos(os.path.join(log_dir, "rendered.mp4"))
