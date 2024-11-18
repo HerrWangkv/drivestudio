@@ -465,6 +465,7 @@ class Model:
 def parse_args():
     parser = argparse.ArgumentParser(description="Render from checkpoint")
     parser.add_argument('model', type=str, help='Path to the model checkpoint to load')
+    parser.add_argument('--threshold', '-t', type=float, default=0.1, help='Pruning threshold')
     return parser.parse_args()
 
 
@@ -477,6 +478,6 @@ if __name__ == "__main__":
     print(f"Loading config from {config_path}")
     cfg = OmegaConf.load(config_path)
     dataset = Dataset(cfg.data)
-    model = Model(cfg, dataset, threshold=0.1)
+    model = Model(cfg, dataset, threshold=args.threshold)
     model.resume_from_checkpoint(model_path)
-    model.save_videos(os.path.join(log_dir, "rendered.mp4"))
+    model.save_videos(os.path.join(log_dir, f"rendered_{args.threshold}.mp4"))
