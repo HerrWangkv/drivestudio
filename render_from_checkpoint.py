@@ -4,6 +4,7 @@ import argparse
 import imageio
 
 import numpy as np
+import matplotlib.pyplot as plt
 
 from torch import nn, Tensor
 from tqdm import tqdm, trange
@@ -84,10 +85,11 @@ class Dataset:
         return self.full_image_set.get_image(idx, camera_downscale=1.0)
     
 class Model:
-    def __init__(self, cfg, dataset, threshold):
+    def __init__(self, cfg, dataset, threshold, map_size, vis=False):
         self.threshold = threshold
-        print(f"Pruning threshold: {self.threshold}")
-        self.prune_or_not = True if self.threshold > 0 else False
+        self.map_size = map_size
+        self.vis = vis
+        print(f"Pruning threshold: {self.threshold}, Map size: {self.map_size}, Visualization: {self.vis}")
         self.model_config = cfg.model
         self.render_cfg = cfg.trainer.render
         self.gaussian_optim_general_cfg = cfg.trainer.gaussian_optim_general_cfg
@@ -297,7 +299,9 @@ class Model:
         gs: dataclass_gs,
         cam: dataclass_camera,
         **kwargs,
-    ):
+    ):  
+        if (self.threshold == 0):
+            return torch.ones_like(gs.means[:, 0], dtype=torch.bool)
         gs_mask = prune(
                 threshold=self.threshold,
                 means=gs.means,
@@ -375,9 +379,11 @@ class Model:
         }        
         return results
     
-    def render(self, idx):
+    def render(self, idx, num_cams):
         image_infos, camera_infos = self.dataset.get_image(idx)
-
+        if camera_infos['cam_name'] == 'CAM_FRONT':
+            assert idx % num_cams == 0, f"Expected idx to be a multiple of {num_cams}, got {idx}"
+            self.to_camera_front = torch.linalg.inv(camera_infos['camera_to_world'])
         for k, v in image_infos.items():
             if isinstance(v, Tensor):
                 image_infos[k] = v.cuda(non_blocking=True)
@@ -401,16 +407,22 @@ class Model:
             cam=processed_cam,
             image_ids=image_infos["img_idx"].flatten()[0]
         )
-        if self.prune_or_not:
-            gs_mask = self.prune_gaussians(
-                gs=gs,
-                cam=processed_cam,
-                near_plane=self.render_cfg.near_plane,
-                far_plane=self.render_cfg.far_plane,
-                radius_clip=self.render_cfg.get('radius_clip', 0.)
-            )
-        else:
-            gs_mask = torch.ones_like(gs.means[:, 0], dtype=torch.bool)
+        gs_mask = self.prune_gaussians(
+            gs=gs,
+            cam=processed_cam,
+            near_plane=self.render_cfg.near_plane,
+            far_plane=self.render_cfg.far_plane,
+            radius_clip=self.render_cfg.get('radius_clip', 0.)
+        )
+        gs_homogeneous = torch.cat([gs.means, torch.ones((gs.means.shape[0], 1), device=gs.means.device)], dim=-1)
+        gs_in_camera_front = torch.matmul(self.to_camera_front, gs_homogeneous.T).T[:, :3]
+        gs_mask[gs_in_camera_front[:,0] < -self.map_size/2] = False
+        gs_mask[gs_in_camera_front[:,0] > self.map_size/2] = False
+        gs_mask[gs_in_camera_front[:,2] < -self.map_size/2] = False
+        gs_mask[gs_in_camera_front[:,2] > self.map_size/2] = False
+        if self.vis:
+            plt.scatter(gs.means[gs_mask, 0].cpu().numpy(), gs.means[gs_mask, 2].cpu().numpy())
+
         # render gaussians
         outputs = self.render_gaussians(
             gs=gs[gs_mask],
@@ -444,7 +456,7 @@ class Model:
             mask = None
             for j in range(num_cams):
                 with torch.no_grad():
-                    rgb, cam_name, gs_mask = self.render(i*num_cams+j)
+                    rgb, cam_name, gs_mask = self.render(i*num_cams+j, num_cams)
                     mask = gs_mask if mask is None else torch.logical_or(mask, gs_mask)
                     if self.num_gs_points == 0:
                         self.num_gs_points = len(mask)
@@ -452,6 +464,12 @@ class Model:
                         assert self.num_gs_points == len(mask), "Number of points in the mask is not consistent"
                 rgbs.append(rgb)
                 cam_names.append(cam_name)
+            if self.vis:
+                plt.grid(True)
+                bev_dir = os.path.join(os.path.dirname(save_pth), "bev")
+                os.makedirs(bev_dir, exist_ok=True)
+                plt.savefig(os.path.join(bev_dir, f"gs_{i}.png"))
+                plt.close()
             self.max_num_per_frame = max(self.max_num_per_frame, int(mask.sum()))
             tiled_img = self.dataset.layout(rgbs, cam_names)    
             merged_list.append(tiled_img)
@@ -466,6 +484,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Render from checkpoint")
     parser.add_argument('model', type=str, help='Path to the model checkpoint to load')
     parser.add_argument('--threshold', '-t', type=float, default=0.1, help='Pruning threshold')
+    parser.add_argument('--map_size', '-m', type=int, default=200, help='Size of the map')
+    parser.add_argument('--vis', '-v', action='store_true', help='Visualize the BEV Gaussian points')
     return parser.parse_args()
 
 
@@ -478,6 +498,6 @@ if __name__ == "__main__":
     print(f"Loading config from {config_path}")
     cfg = OmegaConf.load(config_path)
     dataset = Dataset(cfg.data)
-    model = Model(cfg, dataset, threshold=args.threshold)
+    model = Model(cfg, dataset, threshold=args.threshold, map_size=args.map_size, vis=args.vis)
     model.resume_from_checkpoint(model_path)
-    model.save_videos(os.path.join(log_dir, f"rendered_{args.threshold}.mp4"))
+    model.save_videos(os.path.join(log_dir, f"rendered_{args.threshold}_{args.map_size}.mp4"))
