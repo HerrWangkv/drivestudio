@@ -7,13 +7,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from torch import nn, Tensor
-from tqdm import tqdm, trange
+from tqdm import trange
 from omegaconf import OmegaConf
-from gsplat_utils import rasterization, prune 
+from gsplat.rendering import rasterization
+from gsplat_utils import prune 
 
 from utils.misc import import_str
 from utils.visualization import to8b, get_layout
-from datasets.driving_dataset import DrivingDataset
 from models.trainers.base import GSModelType
 from models.gaussians.basics import dataclass_camera, dataclass_gs
 from datasets.base.split_wrapper import SplitWrapper
@@ -101,6 +101,7 @@ class Model:
         self.num_full_images = len(dataset.full_image_set)
         self.num_gs_points = 0
         self.max_num_per_frame = 0
+        gs = None
         
         # init scene scale
         self._init_scene(scene_aabb=dataset.aabb)
