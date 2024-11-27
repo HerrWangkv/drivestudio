@@ -384,6 +384,7 @@ class Model:
         image_infos, camera_infos = self.dataset.get_image(idx)
         if camera_infos['cam_name'] == 'CAM_FRONT':
             assert idx % num_cams == 0, f"Expected idx to be a multiple of {num_cams}, got {idx}"
+            self.camera_front_to_world = camera_infos['camera_to_world']
             self.to_camera_front = torch.linalg.inv(camera_infos['camera_to_world'])
         for k, v in image_infos.items():
             if isinstance(v, Tensor):
@@ -423,6 +424,9 @@ class Model:
         gs_mask[gs_in_camera_front[:,2] > self.map_size/2] = False
         if self.vis:
             plt.scatter(gs.means[gs_mask, 0].cpu().numpy(), gs.means[gs_mask, 2].cpu().numpy())
+            corners = torch.tensor([[-self.map_size/2, 0, -self.map_size/2], [self.map_size/2, 0, -self.map_size/2], [self.map_size/2, 0, self.map_size/2], [-self.map_size/2, 0, self.map_size/2], [-self.map_size/2, 0, -self.map_size/2]], device=gs.means.device)
+            corners_in_world = torch.matmul(self.camera_front_to_world, torch.cat([corners, torch.ones((corners.shape[0], 1), device=corners.device)], dim=-1).T).T[:, :3]
+            plt.plot(corners_in_world.cpu().numpy()[:, 0], corners_in_world.cpu().numpy()[:, 2], 'k', linewidth=5)
 
         # render gaussians
         outputs = self.render_gaussians(
@@ -467,6 +471,7 @@ class Model:
                 cam_names.append(cam_name)
             if self.vis:
                 plt.grid(True)
+                plt.axis('scaled')
                 bev_dir = os.path.join(os.path.dirname(save_pth), "bev")
                 os.makedirs(bev_dir, exist_ok=True)
                 plt.savefig(os.path.join(bev_dir, f"gs_{i}.png"))
