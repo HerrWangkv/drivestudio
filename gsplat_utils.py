@@ -15,8 +15,7 @@ from gsplat.cuda._wrapper import (
     isect_tiles,
 )
 
-def prune(
-    threshold: float,
+def single_camera_importance(
     means: Tensor,  # [N, 3]
     quats: Tensor,  # [N, 4]
     scales: Tensor,  # [N, 3]
@@ -116,8 +115,7 @@ def prune(
     isect_offsets = isect_offset_encode(isect_ids, C, tile_width, tile_height)
 
     # print("rank", world_rank, "Before rasterize_to_pixels")
-    gs_mask = contribution_above_threshold(
-        threshold,
+    importance = calculate_importance(
         means2d,
         conics,
         opacities,
@@ -127,10 +125,9 @@ def prune(
         isect_offsets,
         flatten_ids,
     )
-    return gs_mask
+    return importance
 
-def contribution_above_threshold(
-    threshold: float,
+def calculate_importance(
     means2d: Tensor,  # [C, N, 2]
     conics: Tensor,  # [C, N, 3]
     opacities: Tensor,  # [C, N]
@@ -145,6 +142,7 @@ def contribution_above_threshold(
     from gsplat.cuda._wrapper import rasterize_to_indices_in_range
 
     C, N = means2d.shape[:2]
+    importance = torch.zeros(N, device=means2d.device)
     n_isects = len(flatten_ids)
     device = means2d.device
     mask = torch.zeros((N), device=device).bool()
@@ -200,8 +198,10 @@ def contribution_above_threshold(
         weights, trans = render_weight_from_alpha(
             alphas, ray_indices=indices, n_rays=total_pixels
         )
-        mask[gs_ids[weights > threshold]] = True # Note that transmittances are always 1.0
-    return mask
+        tmp = torch.zeros_like(importance)
+        tmp.scatter_add_(0, gs_ids, weights) # due to index duplication and inplace operation
+        importance += tmp # Note that transmittances are always 1.0
+    return importance
 
 class Gaussian:
     def __init__(self, gaussian):
