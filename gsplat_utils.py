@@ -7,6 +7,7 @@ from torch import Tensor
 from typing_extensions import Literal
 import numpy as np
 from plyfile import PlyData, PlyElement
+from pytorch3d.ops import sample_farthest_points
 
 from gsplat.cuda._wrapper import (
     fully_fused_projection,
@@ -229,6 +230,10 @@ class Gaussian:
     def quats(self):
         return self._quats.detach().cpu().numpy()
     
+    def __len__(self):
+        assert self._means.shape[0] == self._features_dc.shape[0] == self._features_rest.shape[0] == self._opacities.shape[0] == self._scales.shape[0] == self._quats.shape[0]
+        return self._means.shape[0]
+
     def __getitem__(self, mask):
         return Gaussian(
             {
@@ -240,6 +245,9 @@ class Gaussian:
                 '_quats': self._quats[mask],
             }
         )
+    def farthest_point_sample(self, num_points):
+        _, indices = sample_farthest_points(self._means.unsqueeze(0), K=num_points, random_start_point=True)
+        return self[indices[0].cpu().numpy()]
 
 
 def export_ply(gaussian, out_path):
