@@ -5,6 +5,8 @@ import torch
 import torch.distributed
 from torch import Tensor
 from typing_extensions import Literal
+import numpy as np
+from plyfile import PlyData, PlyElement
 
 from gsplat.cuda._wrapper import (
     fully_fused_projection,
@@ -18,7 +20,6 @@ def prune(
     quats: Tensor,  # [N, 4]
     scales: Tensor,  # [N, 3]
     opacities: Tensor,  # [N]
-    colors: Tensor,  # [(C,) N, D] or [(C,) N, K, 3]
     viewmats: Tensor,  # [C, 4, 4]
     Ks: Tensor,  # [C, 3, 3]
     width: int,
@@ -27,15 +28,12 @@ def prune(
     far_plane: float = 1e10,
     radius_clip: float = 0.0,
     eps2d: float = 0.3,
-    sh_degree: Optional[int] = None,
     packed: bool = True,
     tile_size: int = 16,
-    backgrounds: Optional[Tensor] = None,
     render_mode: Literal["RGB", "D", "ED", "RGB+D", "RGB+ED"] = "RGB",
     sparse_grad: bool = False,
     absgrad: bool = False,
     rasterize_mode: Literal["classic", "antialiased"] = "classic",
-    channel_chunk: int = 32,
     distributed: bool = False,
     ortho: bool = False,
     ) -> Tensor:
@@ -50,18 +48,6 @@ def prune(
     assert viewmats.shape == (C, 4, 4), viewmats.shape
     assert Ks.shape == (C, 3, 3), Ks.shape
     assert render_mode in ["RGB", "D", "ED", "RGB+D", "RGB+ED"], render_mode
-
-    if sh_degree is None:
-        # treat colors as post-activation values, should be in shape [N, D] or [C, N, D]
-        assert (colors.dim() == 2 and colors.shape[0] == N) or (
-            colors.dim() == 3 and colors.shape[:2] == (C, N)
-        ), colors.shape
-        if distributed:
-            assert (
-                colors.dim() == 2
-            ), "Distributed mode only supports per-Gaussian colors."
-    else:
-        raise NotImplementedError
 
     if absgrad:
         assert not distributed, "AbsGrad is not supported in distributed mode."
@@ -103,40 +89,11 @@ def prune(
     if compensations is not None:
         opacities = opacities * compensations
 
-    # Turn colors into [C, N, D] or [nnz, D] to pass into rasterize_to_pixels()
-    if sh_degree is None:
-        # Colors are post-activation values, with shape [N, D] or [C, N, D]
-        if packed:
-            raise NotImplementedError
-        else:
-            if colors.dim() == 2:
-                # Turn [N, D] into [C, N, D]
-                colors = colors.expand(C, -1, -1)
-            else:
-                # colors is already [C, N, D]
-                pass
-    else:
-        raise NotImplementedError
-
     # If in distributed mode, we need to scatter the GSs to the destination ranks, based
     # on which cameras they are visible to, which we already figured out in the projection
     # stage.
     if distributed:
         raise NotImplementedError
-
-    # Rasterize to pixels
-    if render_mode in ["RGB+D", "RGB+ED"]:
-        colors = torch.cat((colors, depths[..., None]), dim=-1)
-        if backgrounds is not None:
-            backgrounds = torch.cat(
-                [backgrounds, torch.zeros(C, 1, device=backgrounds.device)], dim=-1
-            )
-    elif render_mode in ["D", "ED"]:
-        colors = depths[..., None]
-        if backgrounds is not None:
-            backgrounds = torch.zeros(C, 1, device=backgrounds.device)
-    else:  # RGB
-        pass
 
     # Identify intersecting tiles
     tile_width = math.ceil(width / float(tile_size))
@@ -158,36 +115,29 @@ def prune(
     isect_offsets = isect_offset_encode(isect_ids, C, tile_width, tile_height)
 
     # print("rank", world_rank, "Before rasterize_to_pixels")
-    if colors.shape[-1] > channel_chunk:
-        raise NotImplementedError
-    else:
-        gs_mask = contribution_above_threshold(
-            threshold,
-            means2d,
-            conics,
-            colors,
-            opacities,
-            width,
-            height,
-            tile_size,
-            isect_offsets,
-            flatten_ids,
-            backgrounds=backgrounds,
-        )
+    gs_mask = contribution_above_threshold(
+        threshold,
+        means2d,
+        conics,
+        opacities,
+        width,
+        height,
+        tile_size,
+        isect_offsets,
+        flatten_ids,
+    )
     return gs_mask
 
 def contribution_above_threshold(
     threshold: float,
     means2d: Tensor,  # [C, N, 2]
     conics: Tensor,  # [C, N, 3]
-    colors: Tensor,  # [C, N, channels]
     opacities: Tensor,  # [C, N]
     image_width: int,
     image_height: int,
     tile_size: int,
     isect_offsets: Tensor,  # [C, tile_height, tile_width]
     flatten_ids: Tensor,  # [n_isects]
-    backgrounds: Optional[Tensor] = None,  # [C, channels]
     batch_per_iter: int = 100,
 ):
     
@@ -197,10 +147,6 @@ def contribution_above_threshold(
     n_isects = len(flatten_ids)
     device = means2d.device
     mask = torch.zeros((N), device=device).bool()
-
-    render_colors = torch.zeros(
-        (C, image_height, image_width, colors.shape[-1]), device=device
-    )
     render_alphas = torch.zeros((C, image_height, image_width, 1), device=device)
 
     # Split Gaussians into batches and iteratively accumulate the renderings
@@ -234,7 +180,6 @@ def contribution_above_threshold(
             from nerfacc import accumulate_along_rays, render_weight_from_alpha
         except ImportError:
             raise ImportError("Please install nerfacc package: pip install nerfacc")
-        channels = colors.shape[-1]
         pixel_ids_x = pixel_ids % image_width
         pixel_ids_y = pixel_ids // image_width
         pixel_coords = torch.stack([pixel_ids_x, pixel_ids_y], dim=-1) + 0.5  # [M, 2]
@@ -256,3 +201,77 @@ def contribution_above_threshold(
         )
         mask[gs_ids[weights > threshold]] = True # Note that transmittances are always 1.0
     return mask
+
+class Gaussian:
+    def __init__(self, gaussian):
+        self._means = gaussian['_means']
+        self._features_dc = gaussian['_features_dc']
+        self._features_rest = gaussian['_features_rest']
+        self._opacities = gaussian['_opacities']
+        self._scales = gaussian['_scales']
+        self._quats = gaussian['_quats']
+    @property
+    def means(self):
+        return self._means.detach().cpu().numpy()
+    @property
+    def features_dc(self):
+        return self._features_dc.detach().cpu().numpy()
+    @property
+    def features_rest(self):
+        return self._features_rest.detach().cpu().numpy()
+    @property
+    def opacities(self):
+        return self._opacities.detach().cpu().numpy()
+    @property
+    def scales(self):
+        return self._scales.detach().cpu().numpy()
+    @property
+    def quats(self):
+        return self._quats.detach().cpu().numpy()
+    
+    def __getitem__(self, mask):
+        return Gaussian(
+            {
+                '_means': self._means[mask],
+                '_features_dc': self._features_dc[mask],
+                '_features_rest': self._features_rest[mask],
+                '_opacities': self._opacities[mask],
+                '_scales': self._scales[mask],
+                '_quats': self._quats[mask],
+            }
+        )
+
+
+def export_ply(gaussian, out_path):
+    xyz = gaussian.means
+    normals = np.zeros_like(xyz)
+    f_dc = gaussian.features_dc.reshape((gaussian.features_dc.shape[0], -1))
+    f_rest = gaussian.features_rest.reshape((gaussian.features_rest.shape[0], -1))
+    opacities = gaussian.opacities
+    scale = gaussian.scales
+    rotation = gaussian.quats
+
+    def construct_list_of_attributes(gaussian):
+        l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
+        # All channels except the 3 DC
+        for i in range(3):
+            l.append('f_dc_{}'.format(i))
+        for i in range(45):
+            l.append('f_rest_{}'.format(i))
+        l.append('opacity')
+        for i in range(gaussian.scales.shape[1]):
+            l.append('scale_{}'.format(i))
+        for i in range(gaussian.quats.shape[1]):
+            l.append('rot_{}'.format(i))
+        return l
+
+    dtype_full = [(attribute, 'f4') for attribute in construct_list_of_attributes(gaussian)]
+    attribute_list = [xyz, normals, f_dc, f_rest, opacities, scale, rotation]
+
+    elements = np.empty(xyz.shape[0], dtype=dtype_full)
+    attributes = np.concatenate(attribute_list, axis=1)
+    # do not save 'features_extra' for ply
+    # attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, f_extra), axis=1)
+    elements[:] = list(map(tuple, attributes))
+    el = PlyElement.describe(elements, 'vertex')
+    PlyData([el]).write(out_path)

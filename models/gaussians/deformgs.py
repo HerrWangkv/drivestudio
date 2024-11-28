@@ -165,3 +165,54 @@ class DeformableGaussians(VanillaGaussians):
                 raise ValueError(f"Inf detected in gaussian {k} at step {self.step}")
                 
         return gs_dict
+    
+    def get_raw_gaussians(self) -> Dict:
+        filter_mask = torch.ones_like(self._means[:, 0], dtype=torch.bool)
+        self.filter_mask = filter_mask
+        
+        delta_xyz, delta_quat, delta_scale = None, None, None
+        if self.defrom_gs:
+            delta_xyz, delta_quat, delta_scale = self.get_deformation(self._means)
+            if self.delta_xyz_rescale:
+                delta_xyz = delta_xyz * self.scene_scale
+
+        if delta_xyz is not None:
+            world_means = self._means + delta_xyz
+        else:
+            world_means = self._means
+        
+        if delta_quat is not None:
+            world_quats = self.get_quats + delta_quat
+        else:
+            world_quats = self.get_quats
+        
+        if delta_scale is not None:
+            activated_scales = torch.exp(self._scales + delta_scale)
+        else:
+            activated_scales = torch.exp(self._scales)
+
+        activated_opacities = self.get_opacity
+        activated_rotations = self.quat_act(world_quats)
+        if self._features_rest.shape[1] != 15:
+            features_rest = torch.zeros((self._features_rest.shape[0], 15, 3), device=self.device)
+            features_rest[:, :self._features_rest.shape[1], :] = self._features_rest
+        else:
+            features_rest = self._features_rest
+        # collect gaussians information
+        gs_dict = dict(
+            _means=world_means[filter_mask],
+            _features_dc=self._features_dc[filter_mask],
+            _features_rest=features_rest[filter_mask],
+            _opacities=activated_opacities[filter_mask],
+            _scales=activated_scales[filter_mask],
+            _quats=activated_rotations[filter_mask],
+        )
+        
+        # check nan and inf in gs_dict
+        for k, v in gs_dict.items():
+            if torch.isnan(v).any():
+                raise ValueError(f"NaN detected in gaussian {k} at step {self.step}")
+            if torch.isinf(v).any():
+                raise ValueError(f"Inf detected in gaussian {k} at step {self.step}")
+                
+        return gs_dict

@@ -424,6 +424,54 @@ class PeriodicVibrationGaussians(VanillaGaussians):
                 
         return gs_dict
 
+
+    def get_raw_gaussians(self) -> Dict:
+        # set time and smooth strategy
+        scaled_train_t = self.normalized_timestamps[self.cur_frame] * self.train_time_scale # t2 in paper
+        if self.training and (
+            self.ctrl_cfg.enable_temporal_smoothing and random.random() < self.ctrl_cfg.smooth_probability
+        ):
+            self.in_smooth = True
+            bound = self.normalized_time_interval * self.ctrl_cfg.distribution_span * self.train_time_scale
+            self.cur_time = scaled_train_t + uniform.Uniform(-bound, bound).sample((1,)).item() # t1 in paper
+            self.delta_t = scaled_train_t - self.cur_time # t2 - t1
+        else:
+            self.in_smooth = False
+            self.cur_time = scaled_train_t
+            self.delta_t = 0.0
+            
+        filter_mask = (self.get_marginal_t > 0.05).squeeze()
+        self.filter_mask = filter_mask
+        
+        means = self.temporal_means
+        activated_opacities = self.temporal_opacities
+        activated_scales = self.get_scaling
+        activated_rotations = self.get_quats
+
+        if self._features_rest.shape[1] != 15:
+            features_rest = torch.zeros((self._features_rest.shape[0], 15, 3), device=self.device)
+            features_rest[:, :self._features_rest.shape[1], :] = self._features_rest
+        else:
+            features_rest = self._features_rest
+        # collect gaussians information
+        gs_dict = dict(
+            _means=means[filter_mask],
+            _features_dc=self._features_dc[filter_mask],
+            _features_rest=features_rest[filter_mask],
+            _opacities=activated_opacities[filter_mask],
+            _scales=activated_scales[filter_mask],
+            _quats=activated_rotations[filter_mask],
+        )
+        
+        # check nan and inf in gs_dict
+        for k, v in gs_dict.items():
+            if torch.isnan(v).any():
+                raise ValueError(f"NaN detected in gaussian {k} at step {self.step}")
+            if torch.isinf(v).any():
+                raise ValueError(f"Inf detected in gaussian {k} at step {self.step}")
+                
+        return gs_dict
+    
     def compute_reg_loss(self):
         loss_dict = super().compute_reg_loss()
         

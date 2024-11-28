@@ -10,7 +10,8 @@ from torch import nn, Tensor
 from tqdm import trange
 from omegaconf import OmegaConf
 from gsplat.rendering import rasterization
-from gsplat_utils import prune 
+from gsplat.cuda._wrapper import spherical_harmonics
+from gsplat_utils import prune, Gaussian, export_ply
 
 from utils.misc import import_str
 from utils.visualization import to8b, get_layout
@@ -114,7 +115,6 @@ class Model:
         self.gaussian_classes = {}
         self._init_models()
         self.pts_labels = None # will be overwritten in forward
-        self.render_dynamic_mask = False
 
     def _init_scene(self, scene_aabb) -> None:
         self.aabb = scene_aabb.to(self.device)
@@ -227,6 +227,7 @@ class Model:
         """
         state_dict = torch.load(ckpt_path)
         self.load_state_dict(state_dict, load_only_model=load_only_model, strict=True)
+        self.log_dir = os.path.dirname(ckpt_path)
 
     def process_camera(
         self,
@@ -252,64 +253,46 @@ class Model:
         )
         
         return camera_dict
-    def collect_gaussians(
-        self,
-        cam: dataclass_camera,
-        image_ids: torch.Tensor # leave it here for future use
-    ) -> dataclass_gs:
+
+    def collect_gaussians(self) -> dataclass_gs:
         gs_dict = {
             "_means": [],
+            "_features_dc": [],
+            "_features_rest": [],
+            "_opacities": [],
             "_scales": [],
             "_quats": [],
-            "_rgbs": [],
-            "_opacities": [],
-            "class_labels": [],
         }
         for class_name in self.gaussian_classes.keys():
-            gs = self.models[class_name].get_gaussians(cam)
+            gs = self.models[class_name].get_raw_gaussians()
             if gs is None:
                 continue
     
             # collect gaussians
-            gs["class_labels"] = torch.full((gs["_means"].shape[0],), self.gaussian_classes[class_name], device=self.device)
             for k, _ in gs.items():
                 gs_dict[k].append(gs[k])
         
         for k, v in gs_dict.items():
             gs_dict[k] = torch.cat(v, dim=0)
-            
-        # get the class labels
-        self.pts_labels = gs_dict.pop("class_labels")
-        if self.render_dynamic_mask:
-            self.dynamic_pts_mask = (self.pts_labels != 0).float()
-
-        gaussians = dataclass_gs(
-            _means=gs_dict["_means"],
-            _scales=gs_dict["_scales"],
-            _quats=gs_dict["_quats"],
-            _rgbs=gs_dict["_rgbs"],
-            _opacities=gs_dict["_opacities"],
-            detach_keys=[],    # if "means" in detach_keys, then the means will be detached
-            extras=None        # to save some extra information (TODO) more flexible way
-        )
-        
-        return gaussians
+        self.gs = Gaussian(gs_dict)
+        if self.num_gs_points == 0:
+            self.num_gs_points = len(self.gs._means)
+        else:
+            assert self.num_gs_points == len(self.gs._means), "Number of points in the mask is not consistent"
     
     def prune_gaussians(
         self,
-        gs: dataclass_gs,
         cam: dataclass_camera,
         **kwargs,
     ):  
         if (self.threshold == 0):
-            return torch.ones_like(gs.means[:, 0], dtype=torch.bool)
+            return torch.ones_like(self.gs._means[:, 0], dtype=torch.bool)
         gs_mask = prune(
                 threshold=self.threshold,
-                means=gs.means,
-                quats=gs.quats,
-                scales=gs.scales,
-                opacities=gs.opacities.squeeze(),
-                colors=gs.rgbs,
+                means=self.gs._means,
+                quats=self.gs._quats,
+                scales=self.gs._scales,
+                opacities=self.gs._opacities.squeeze(),
                 viewmats=torch.linalg.inv(cam.camtoworlds)[None, ...],  # [C, 4, 4]
                 Ks=cam.Ks[None, ...],  # [C, 3, 3]
                 width=cam.W,
@@ -321,34 +304,29 @@ class Model:
                 **kwargs,
             )
         return gs_mask
+    
+    def return_colors(self, gs: Gaussian, cam: dataclass_camera):
+        colors = torch.cat([gs._features_dc[:, None, :], gs._features_rest], dim=1)
+        viewdirs = gs._means.detach() - cam.camtoworlds.data[..., :3, 3]  # (N, 3)
+        viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
+        rgbs = spherical_harmonics(3, viewdirs, colors)
+        rgbs = torch.clamp(rgbs + 0.5, 0.0, 1.0)
+        return rgbs
 
-    def affine_transformation(
-        self,
-        rgb_blended,
-        image_infos
-        ):
-        if "Affine" in self.models:
-            affine_trs = self.models['Affine'](image_infos)
-            rgb_transformed = (affine_trs[..., :3, :3] @ rgb_blended[..., None] + affine_trs[..., :3, 3:])[..., 0]
-            
-            return rgb_transformed
-        else:       
-            return rgb_blended
-        
     def render_gaussians(
         self,
-        gs: dataclass_gs,
+        gs: Gaussian,
         cam: dataclass_camera,
         **kwargs,
     ):
-    
+        rgbs = self.return_colors(gs, cam)
         def render_fn(opaticy_mask=None, return_info=False):
             renders, alphas, info = rasterization(
-                means=gs.means,
-                quats=gs.quats,
-                scales=gs.scales,
-                opacities=gs.opacities.squeeze()*opaticy_mask if opaticy_mask is not None else gs.opacities.squeeze(),
-                colors=gs.rgbs,
+                means=gs._means,
+                quats=gs._quats,
+                scales=gs._scales,
+                opacities=gs._opacities.squeeze()*opaticy_mask if opaticy_mask is not None else gs._opacities.squeeze(),
+                colors=rgbs,
                 viewmats=torch.linalg.inv(cam.camtoworlds)[None, ...],  # [C, 4, 4]
                 Ks=cam.Ks[None, ...],  # [C, 3, 3]
                 width=cam.W,
@@ -379,118 +357,297 @@ class Model:
             "opacity": opacity
         }        
         return results
-    
-    def render(self, idx, num_cams):
-        image_infos, camera_infos = self.dataset.get_image(idx)
-        if camera_infos['cam_name'] == 'CAM_FRONT':
-            assert idx % num_cams == 0, f"Expected idx to be a multiple of {num_cams}, got {idx}"
-            self.camera_front_to_world = camera_infos['camera_to_world']
-            self.to_camera_front = torch.linalg.inv(camera_infos['camera_to_world'])
-        for k, v in image_infos.items():
-            if isinstance(v, Tensor):
-                image_infos[k] = v.cuda(non_blocking=True)
-        for k, v in camera_infos.items():
-            if isinstance(v, Tensor):
-                camera_infos[k] = v.cuda(non_blocking=True)
-        normed_time = image_infos["normed_time"].flatten()[0]
-        self.cur_frame = torch.argmin(
-            torch.abs(self.normalized_timestamps - normed_time)
-        )
-        for class_name in self.gaussian_classes.keys():
-            model = self.models[class_name]
-            if hasattr(model, 'set_cur_frame'):
-                model.set_cur_frame(self.cur_frame)
 
-        processed_cam = self.process_camera(
-            camera_infos=camera_infos,
-            image_ids=image_infos["img_idx"].flatten()[0],
-        )
-        gs = self.collect_gaussians(
-            cam=processed_cam,
-            image_ids=image_infos["img_idx"].flatten()[0]
-        )
-        gs_mask = self.prune_gaussians(
-            gs=gs,
-            cam=processed_cam,
-            near_plane=self.render_cfg.near_plane,
-            far_plane=self.render_cfg.far_plane,
-            radius_clip=self.render_cfg.get('radius_clip', 0.)
-        )
-        gs_homogeneous = torch.cat([gs.means, torch.ones((gs.means.shape[0], 1), device=gs.means.device)], dim=-1)
-        gs_in_camera_front = torch.matmul(self.to_camera_front, gs_homogeneous.T).T[:, :3]
-        gs_mask[gs_in_camera_front[:,0] < -self.map_size/2] = False
-        gs_mask[gs_in_camera_front[:,0] > self.map_size/2] = False
-        gs_mask[gs_in_camera_front[:,2] < -self.map_size/2] = False
-        gs_mask[gs_in_camera_front[:,2] > self.map_size/2] = False
-        if self.vis:
-            plt.scatter(gs.means[gs_mask, 0].cpu().numpy(), gs.means[gs_mask, 2].cpu().numpy())
-            corners = torch.tensor([[-self.map_size/2, 0, -self.map_size/2], [self.map_size/2, 0, -self.map_size/2], [self.map_size/2, 0, self.map_size/2], [-self.map_size/2, 0, self.map_size/2], [-self.map_size/2, 0, -self.map_size/2]], device=gs.means.device)
-            corners_in_world = torch.matmul(self.camera_front_to_world, torch.cat([corners, torch.ones((corners.shape[0], 1), device=corners.device)], dim=-1).T).T[:, :3]
-            plt.plot(corners_in_world.cpu().numpy()[:, 0], corners_in_world.cpu().numpy()[:, 2], 'k', linewidth=5)
+    def prune_frame(self, frame, num_cams):
+        mask = None
+        for idx in range(frame*num_cams, (frame+1)*num_cams):
+            image_infos, camera_infos = self.dataset.get_image(idx)
+            if camera_infos['cam_name'] == 'CAM_FRONT':
+                assert idx % num_cams == 0, f"Expected idx to be a multiple of {num_cams}, got {idx}"
+                self.camera_front_to_world = camera_infos['camera_to_world']
+                self.to_camera_front = torch.linalg.inv(camera_infos['camera_to_world'])
+            for k, v in image_infos.items():
+                if isinstance(v, Tensor):
+                    image_infos[k] = v.cuda(non_blocking=True)
+            for k, v in camera_infos.items():
+                if isinstance(v, Tensor):
+                    camera_infos[k] = v.cuda(non_blocking=True)
+            normed_time = image_infos["normed_time"].flatten()[0]
+            self.cur_frame = torch.argmin(
+                torch.abs(self.normalized_timestamps - normed_time)
+            )
+            for class_name in self.gaussian_classes.keys():
+                model = self.models[class_name]
+                if hasattr(model, 'set_cur_frame'):
+                    model.set_cur_frame(self.cur_frame)
 
-        # render gaussians
-        outputs = self.render_gaussians(
-            gs=gs[gs_mask],
-            cam=processed_cam,
-            near_plane=self.render_cfg.near_plane,
-            far_plane=self.render_cfg.far_plane,
-            render_mode="RGB+ED",
-            radius_clip=self.render_cfg.get('radius_clip', 0.)
-        )
-        ret = self.affine_transformation(
-            outputs["rgb_gaussians"], image_infos
-        )
-        return ret.cpu().numpy(), camera_infos["cam_name"], gs_mask
+            processed_cam = self.process_camera(
+                camera_infos=camera_infos,
+                image_ids=image_infos["img_idx"].flatten()[0],
+            )
 
-    def save_videos(
-        self,
-        save_pth: str,
-        num_cams: int = 6,
-        fps: int = 10,
-    ):
-        if self.num_timesteps == 1:  # it's an image
-            writer = imageio.get_writer(save_pth, mode="I")
-            return_frame_id = 0
-        else:
-            return_frame_id = self.num_timesteps // 2
-            writer = imageio.get_writer(save_pth, mode="I", fps=fps)
-        for i in trange(self.num_timesteps, desc="saving video", dynamic_ncols=True):
-            merged_list = []
-            rgbs = []
-            cam_names = []
-            mask = None
-            for j in range(num_cams):
-                with torch.no_grad():
-                    rgb, cam_name, gs_mask = self.render(i*num_cams+j, num_cams)
-                    mask = gs_mask if mask is None else torch.logical_or(mask, gs_mask)
-                    if self.num_gs_points == 0:
-                        self.num_gs_points = len(mask)
-                    else:
-                        assert self.num_gs_points == len(mask), "Number of points in the mask is not consistent"
-                rgbs.append(rgb)
-                cam_names.append(cam_name)
+            self.collect_gaussians()
+            if mask is None:
+                mask = torch.zeros(self.gs._means.shape[0], dtype=torch.bool, device=self.gs._means.device)
+            gs_mask = self.prune_gaussians(
+                cam=processed_cam,
+                near_plane=self.render_cfg.near_plane,
+                far_plane=self.render_cfg.far_plane,
+                radius_clip=self.render_cfg.get('radius_clip', 0.)
+            )
+            mask[gs_mask] = True
+            gs_homogeneous = torch.cat([self.gs._means, torch.ones((self.gs._means.shape[0], 1), device=self.gs._means.device)], dim=-1)
+            gs_in_camera_front = torch.matmul(self.to_camera_front, gs_homogeneous.T).T[:, :3]
+            gs_mask[gs_in_camera_front[:,0] < -self.map_size/2] = False
+            gs_mask[gs_in_camera_front[:,0] > self.map_size/2] = False
+            gs_mask[gs_in_camera_front[:,2] < -self.map_size/2] = False
+            gs_mask[gs_in_camera_front[:,2] > self.map_size/2] = False
             if self.vis:
-                plt.grid(True)
-                plt.axis('scaled')
-                bev_dir = os.path.join(os.path.dirname(save_pth), "bev")
-                os.makedirs(bev_dir, exist_ok=True)
-                plt.savefig(os.path.join(bev_dir, f"gs_{i}.png"))
-                plt.close()
+                plt.scatter(self.gs._means[gs_mask, 0].detach().cpu().numpy(), self.gs._means[gs_mask, 2].detach().cpu().numpy())
+                corners = torch.tensor([[-self.map_size/2, 0, -self.map_size/2], [self.map_size/2, 0, -self.map_size/2], [self.map_size/2, 0, self.map_size/2], [-self.map_size/2, 0, self.map_size/2], [-self.map_size/2, 0, -self.map_size/2]], device=self.gs._means.device)
+                corners_in_world = torch.matmul(self.camera_front_to_world, torch.cat([corners, torch.ones((corners.shape[0], 1), device=corners.device)], dim=-1).T).T[:, :3]
+                plt.plot(corners_in_world.cpu().numpy()[:, 0], corners_in_world.cpu().numpy()[:, 2], 'k', linewidth=5)
+        if self.vis:
+            plt.grid(True)
+            plt.axis('scaled')
+            bev_dir = os.path.join(self.log_dir, "bev")
+            os.makedirs(bev_dir, exist_ok=True)
+            plt.savefig(os.path.join(bev_dir, f"gs_{frame}.png"))
+            plt.close()
+        return mask
+    
+    def save_frame(self, mask, save_pth):
+        export_ply(self.gs[mask], save_pth)
+
+    def render_frame(self, frame, mask, num_cams):
+        merged_list = []
+        rgbs = []
+        cam_names = []
+        for idx in range(frame*num_cams, (frame+1)*num_cams):
+            image_infos, camera_infos = self.dataset.get_image(idx)
+            for k, v in image_infos.items():
+                if isinstance(v, Tensor):
+                    image_infos[k] = v.cuda(non_blocking=True)
+            for k, v in camera_infos.items():
+                if isinstance(v, Tensor):
+                    camera_infos[k] = v.cuda(non_blocking=True)
+            processed_cam = self.process_camera(
+                camera_infos=camera_infos,
+                image_ids=image_infos["img_idx"].flatten()[0],
+            )
+            outputs = self.render_gaussians(
+                gs=self.gs[mask],
+                cam=processed_cam,
+                near_plane=self.render_cfg.near_plane,
+                far_plane=self.render_cfg.far_plane,
+                render_mode="RGB+ED",
+                radius_clip=self.render_cfg.get('radius_clip', 0.)
+            )
+            rgbs.append(outputs["rgb_gaussians"].detach().cpu().numpy())
+            cam_names.append(camera_infos["cam_name"])
+        tiled_img = self.dataset.layout(rgbs, cam_names)
+        merged_list.append(tiled_img)
+        merged_frame = to8b(np.concatenate(merged_list, axis=0))
+        return merged_frame   
+
+    def process_all_frames(self, render=False, save=False, num_cams=6):
+        save_model_dir = os.path.join(self.log_dir, f"pruned_{self.threshold}_{self.map_size}")
+        
+        if not os.path.exists(save_model_dir):
+            os.makedirs(save_model_dir)
+        desc = "Pruning"
+        if render:
+            save_video_path = os.path.join(self.log_dir, f"rendered_{self.threshold}_{self.map_size}.mp4")
+            writer = imageio.get_writer(save_video_path, mode="I", fps=10)
+            desc += " & Rendering"
+        if save:
+            desc += " & Saving"
+        for i in trange(self.num_timesteps, desc=desc, dynamic_ncols=True):
+            mask = self.prune_frame(i, num_cams)
             self.max_num_per_frame = max(self.max_num_per_frame, int(mask.sum()))
-            tiled_img = self.dataset.layout(rgbs, cam_names)    
-            merged_list.append(tiled_img)
-            merged_frame = to8b(np.concatenate(merged_list, axis=0))
-            writer.append_data(merged_frame)
-        writer.close()
-        del rgbs, cam_names
+            if save:
+                save_pth = os.path.join(save_model_dir, f"frame_{i}.ply")
+                self.save_frame(mask, save_pth)
+            if render:
+                merged_frame = self.render_frame(i, mask, num_cams)
+                writer.append_data(merged_frame)
+        if render:
+            writer.close()
         print(f"Overall number of points            : {self.num_gs_points}")
         print(f"Maximum number of points per frame  : {self.max_num_per_frame}")
+
+    # def affine_transformation(
+    #     self,
+    #     rgb_blended,
+    #     image_infos
+    #     ):
+    #     if "Affine" in self.models:
+    #         affine_trs = self.models['Affine'](image_infos)
+    #         rgb_transformed = (affine_trs[..., :3, :3] @ rgb_blended[..., None] + affine_trs[..., :3, 3:])[..., 0]
+            
+    #         return rgb_transformed
+    #     else:       
+    #         return rgb_blended
+        
+    # def render_gaussians(
+    #     self,
+    #     gs: dataclass_gs,
+    #     cam: dataclass_camera,
+    #     **kwargs,
+    # ):
+    
+    #     def render_fn(opaticy_mask=None, return_info=False):
+    #         renders, alphas, info = rasterization(
+    #             means=gs.means,
+    #             quats=gs.quats,
+    #             scales=gs.scales,
+    #             opacities=gs.opacities.squeeze()*opaticy_mask if opaticy_mask is not None else gs.opacities.squeeze(),
+    #             colors=gs.rgbs,
+    #             viewmats=torch.linalg.inv(cam.camtoworlds)[None, ...],  # [C, 4, 4]
+    #             Ks=cam.Ks[None, ...],  # [C, 3, 3]
+    #             width=cam.W,
+    #             height=cam.H,
+    #             packed=self.render_cfg.packed,
+    #             absgrad=self.render_cfg.absgrad,
+    #             sparse_grad=self.render_cfg.sparse_grad,
+    #             rasterize_mode="antialiased" if self.render_cfg.antialiased else "classic",
+    #             **kwargs,
+    #         )
+    #         renders = renders[0]
+    #         alphas = alphas[0].squeeze(-1)
+    #         assert self.render_cfg.batch_size == 1, "batch size must be 1, will support batch size > 1 in the future"
+            
+    #         assert renders.shape[-1] == 4, f"Must render rgb, depth and alpha"
+    #         rendered_rgb, rendered_depth = torch.split(renders, [3, 1], dim=-1)
+            
+    #         if not return_info:
+    #             return torch.clamp(rendered_rgb, max=1.0), rendered_depth, alphas[..., None]
+    #         else:
+    #             return torch.clamp(rendered_rgb, max=1.0), rendered_depth, alphas[..., None], info
+        
+    #     # render rgb and opacity
+    #     rgb, depth, opacity, self.info = render_fn(return_info=True)
+    #     results = {
+    #         "rgb_gaussians": rgb,
+    #         "depth": depth, 
+    #         "opacity": opacity
+    #     }        
+    #     return results
+    
+    # def render(self, idx, num_cams):
+    #     image_infos, camera_infos = self.dataset.get_image(idx)
+    #     if camera_infos['cam_name'] == 'CAM_FRONT':
+    #         assert idx % num_cams == 0, f"Expected idx to be a multiple of {num_cams}, got {idx}"
+    #         self.camera_front_to_world = camera_infos['camera_to_world']
+    #         self.to_camera_front = torch.linalg.inv(camera_infos['camera_to_world'])
+    #     for k, v in image_infos.items():
+    #         if isinstance(v, Tensor):
+    #             image_infos[k] = v.cuda(non_blocking=True)
+    #     for k, v in camera_infos.items():
+    #         if isinstance(v, Tensor):
+    #             camera_infos[k] = v.cuda(non_blocking=True)
+    #     normed_time = image_infos["normed_time"].flatten()[0]
+    #     self.cur_frame = torch.argmin(
+    #         torch.abs(self.normalized_timestamps - normed_time)
+    #     )
+    #     for class_name in self.gaussian_classes.keys():
+    #         model = self.models[class_name]
+    #         if hasattr(model, 'set_cur_frame'):
+    #             model.set_cur_frame(self.cur_frame)
+
+    #     processed_cam = self.process_camera(
+    #         camera_infos=camera_infos,
+    #         image_ids=image_infos["img_idx"].flatten()[0],
+    #     )
+    #     gs = self.collect_gaussians(
+    #         cam=processed_cam,
+    #         image_ids=image_infos["img_idx"].flatten()[0]
+    #     )
+    #     gs_mask = self.prune_gaussians(
+    #         gs=gs,
+    #         cam=processed_cam,
+    #         near_plane=self.render_cfg.near_plane,
+    #         far_plane=self.render_cfg.far_plane,
+    #         radius_clip=self.render_cfg.get('radius_clip', 0.)
+    #     )
+    #     gs_homogeneous = torch.cat([gs.means, torch.ones((gs.means.shape[0], 1), device=gs.means.device)], dim=-1)
+    #     gs_in_camera_front = torch.matmul(self.to_camera_front, gs_homogeneous.T).T[:, :3]
+    #     gs_mask[gs_in_camera_front[:,0] < -self.map_size/2] = False
+    #     gs_mask[gs_in_camera_front[:,0] > self.map_size/2] = False
+    #     gs_mask[gs_in_camera_front[:,2] < -self.map_size/2] = False
+    #     gs_mask[gs_in_camera_front[:,2] > self.map_size/2] = False
+    #     if self.vis:
+    #         plt.scatter(gs.means[gs_mask, 0].cpu().numpy(), gs.means[gs_mask, 2].cpu().numpy())
+    #         corners = torch.tensor([[-self.map_size/2, 0, -self.map_size/2], [self.map_size/2, 0, -self.map_size/2], [self.map_size/2, 0, self.map_size/2], [-self.map_size/2, 0, self.map_size/2], [-self.map_size/2, 0, -self.map_size/2]], device=gs.means.device)
+    #         corners_in_world = torch.matmul(self.camera_front_to_world, torch.cat([corners, torch.ones((corners.shape[0], 1), device=corners.device)], dim=-1).T).T[:, :3]
+    #         plt.plot(corners_in_world.cpu().numpy()[:, 0], corners_in_world.cpu().numpy()[:, 2], 'k', linewidth=5)
+
+    #     # render gaussians
+    #     outputs = self.render_gaussians(
+    #         gs=gs[gs_mask],
+    #         cam=processed_cam,
+    #         near_plane=self.render_cfg.near_plane,
+    #         far_plane=self.render_cfg.far_plane,
+    #         render_mode="RGB+ED",
+    #         radius_clip=self.render_cfg.get('radius_clip', 0.)
+    #     )
+    #     ret = self.affine_transformation(
+    #         outputs["rgb_gaussians"], image_infos
+    #     )
+    #     return ret.cpu().numpy(), camera_infos["cam_name"], gs_mask
+    
+
+    # def save_videos(
+    #     self,
+    #     save_pth: str,
+    #     num_cams: int = 6,
+    #     fps: int = 10,
+    # ):
+    #     if self.num_timesteps == 1:  # it's an image
+    #         writer = imageio.get_writer(save_pth, mode="I")
+    #         return_frame_id = 0
+    #     else:
+    #         return_frame_id = self.num_timesteps // 2
+    #         writer = imageio.get_writer(save_pth, mode="I", fps=fps)
+    #     for i in trange(self.num_timesteps, desc="saving video", dynamic_ncols=True):
+    #         merged_list = []
+    #         rgbs = []
+    #         cam_names = []
+    #         mask = None
+    #         for j in range(num_cams):
+    #             with torch.no_grad():
+    #                 rgb, cam_name, gs_mask = self.render(i*num_cams+j, num_cams)
+    #                 mask = gs_mask if mask is None else torch.logical_or(mask, gs_mask)
+    #                 if self.num_gs_points == 0:
+    #                     self.num_gs_points = len(mask)
+    #                 else:
+    #                     assert self.num_gs_points == len(mask), "Number of points in the mask is not consistent"
+    #             rgbs.append(rgb)
+    #             cam_names.append(cam_name)
+    #         if self.vis:
+    #             plt.grid(True)
+    #             plt.axis('scaled')
+    #             bev_dir = os.path.join(os.path.dirname(save_pth), "bev")
+    #             os.makedirs(bev_dir, exist_ok=True)
+    #             plt.savefig(os.path.join(bev_dir, f"gs_{i}.png"))
+    #             plt.close()
+    #         self.max_num_per_frame = max(self.max_num_per_frame, int(mask.sum()))
+    #         tiled_img = self.dataset.layout(rgbs, cam_names)    
+    #         merged_list.append(tiled_img)
+    #         merged_frame = to8b(np.concatenate(merged_list, axis=0))
+    #         writer.append_data(merged_frame)
+    #     writer.close()
+    #     del rgbs, cam_names
+    #     print(f"Overall number of points            : {self.num_gs_points}")
+    #     print(f"Maximum number of points per frame  : {self.max_num_per_frame}")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Render from checkpoint")
     parser.add_argument('model', type=str, help='Path to the model checkpoint to load')
     parser.add_argument('--threshold', '-t', type=float, default=0.1, help='Pruning threshold')
     parser.add_argument('--map_size', '-m', type=int, default=200, help='Size of the map')
+    parser.add_argument('--save', '-s', action='store_true', help='Save the splats')
+    parser.add_argument('--render', '-r', action='store_true', help='Render the splats')
     parser.add_argument('--vis', '-v', action='store_true', help='Visualize the BEV Gaussian points')
     return parser.parse_args()
 
@@ -506,4 +663,5 @@ if __name__ == "__main__":
     dataset = Dataset(cfg.data)
     model = Model(cfg, dataset, threshold=args.threshold, map_size=args.map_size, vis=args.vis)
     model.resume_from_checkpoint(model_path)
-    model.save_videos(os.path.join(log_dir, f"rendered_{args.threshold}_{args.map_size}.mp4"))
+    model.process_all_frames(render=args.render, save=args.save)
+    # model.save_videos(os.path.join(log_dir, f"rendered_{args.threshold}_{args.map_size}.mp4"))

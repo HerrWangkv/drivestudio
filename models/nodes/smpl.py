@@ -396,6 +396,57 @@ class SMPLNodes(RigidNodes):
         }
         return gs_dict
 
+    def get_raw_gaussians(self) -> Dict[str, torch.Tensor]:
+        filter_mask = torch.ones_like(self._means[:, 0], dtype=torch.bool)
+        self.filter_mask = filter_mask
+        # NOTE: hack here, need to consider a gaussian filter for efficient rendering
+        
+        instance_mask = self.instances_fv[self.cur_frame]
+        if instance_mask.sum() == 0:
+            return None
+                
+        if self.ball_gaussians:
+            world_means = self.transform_means(self._means)
+            world_quats = self._quats
+        else:
+            world_means, world_quats = self.transform_means_and_quats(self._means, self._quats)
+                
+        valid_mask = self.get_pts_valid_mask()
+            
+        activated_opacities = self.get_opacity * valid_mask.float().unsqueeze(-1)
+        if self.ball_gaussians:
+            activated_scales = torch.exp(self._scales.repeat(1, 3))
+        else:
+            activated_scales = torch.exp(self._scales)
+        activated_rotations = self.quat_act(world_quats)
+        
+        if self._features_rest.shape[1] != 15:
+            features_rest = torch.zeros((self._features_rest.shape[0], 15, 3), device=self.device)
+            features_rest[:, :self._features_rest.shape[1], :] = self._features_rest
+        else:
+            features_rest = self._features_rest
+        
+        # collect gaussians information
+        gs_dict = dict(
+            _means=world_means[filter_mask],
+            _features_dc=self._features_dc[filter_mask],
+            _features_rest=features_rest[filter_mask],
+            _opacities=activated_opacities[filter_mask],
+            _scales=activated_scales[filter_mask],
+            _quats=activated_rotations[filter_mask],
+        )
+        # check nan in gs_dict
+        for k, v in gs_dict.items():
+            if torch.isnan(v).any():
+                raise ValueError(f"NaN detected in gaussian {k} at step {self.step}")
+            if torch.isinf(v).any():
+                raise ValueError(f"Inf detected in gaussian {k} at step {self.step}")
+        
+        self._gs_cache = {
+            "_scales": activated_scales[filter_mask],
+        }
+        return gs_dict
+    
     def compute_reg_loss(self):
         loss_dict = super().compute_reg_loss()
 

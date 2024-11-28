@@ -413,6 +413,40 @@ class VanillaGaussians(nn.Module):
                 
         return gs_dict
     
+    def get_raw_gaussians(self) -> Dict:
+        filter_mask = torch.ones_like(self._means[:, 0], dtype=torch.bool)
+        self.filter_mask = filter_mask
+            
+        activated_opacities = self.get_opacity
+        activated_scales = self.get_scaling
+        activated_rotations = self.get_quats
+        
+        if self._features_rest.shape[1] != 15:
+            features_rest = torch.zeros((self._features_rest.shape[0], 15, 3), device=self.device)
+            features_rest[:, :self._features_rest.shape[1], :] = self._features_rest
+        else:
+            features_rest = self._features_rest
+        
+        # collect gaussians information
+        gs_dict = dict(
+            _means=self._means[filter_mask],
+            _features_dc=self._features_dc[filter_mask],
+            _features_rest=features_rest[filter_mask],
+            _opacities=activated_opacities[filter_mask],
+            _scales=activated_scales[filter_mask],
+            _quats=activated_rotations[filter_mask],
+        )
+        
+        # check nan and inf in gs_dict
+        for k, v in gs_dict.items():
+            if torch.isnan(v).any():
+                raise ValueError(f"NaN detected in gaussian {k} at step {self.step}")
+            if torch.isinf(v).any():
+                raise ValueError(f"Inf detected in gaussian {k} at step {self.step}")
+                
+        return gs_dict
+
+    
     def compute_reg_loss(self):
         loss_dict = {}
         sharp_shape_reg_cfg = self.reg_cfg.get("sharp_shape_reg", None)
