@@ -273,7 +273,7 @@ render:
 
 # ------------- logging ------------ #
 logging:
-  vis_freq: 2000 # how often to visualize training stats
+  vis_freq: 40000 # how often to visualize training stats
   print_freq: 500 # how often to print training stats
-  saveckpt_freq: 20000 # how often to save checkpoints
+  saveckpt_freq: 40000 # how often to save checkpoints
   save_seperate_video: True # whether to save seperate videos for each scene
