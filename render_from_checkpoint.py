@@ -223,7 +223,6 @@ class Model:
         """
         state_dict = torch.load(ckpt_path)
         self.load_state_dict(state_dict, load_only_model=load_only_model, strict=True)
-        self.log_dir = os.path.dirname(ckpt_path)
 
     def process_camera(
         self,
@@ -273,8 +272,9 @@ class Model:
         self.gs = Gaussian(gs_dict)
         if self.num_gs_points == 0:
             self.num_gs_points = len(self.gs._means)
-        else:
-            assert self.num_gs_points == len(self.gs._means), "Number of points in the mask is not consistent"
+        elif self.num_gs_points != len(self.gs._means):
+            print(f"self.num_gs_points changes from {self.num_gs_points} to {len(self.gs._means)}")
+            self.num_gs_points = len(self.gs._means)
     
     def sort_gaussians(
         self,
@@ -351,7 +351,7 @@ class Model:
         }        
         return results
 
-    def prune_frame(self, frame, num_cams, num_points, map_size, vis=False):
+    def prune_frame(self, frame, num_cams, num_points, front, back, vis_dir=''):
         importance = None
         for idx in range(frame*num_cams, (frame+1)*num_cams):
             image_infos, camera_infos = self.dataset.get_image(idx)
@@ -392,25 +392,27 @@ class Model:
         # Prune Gaussians outside the map
         gs_homogeneous = torch.cat([self.gs._means, torch.ones((self.gs._means.shape[0], 1), device=self.gs._means.device)], dim=-1)
         gs_in_camera_front = torch.matmul(self.to_camera_front, gs_homogeneous.T).T[:, :3]
+        map_size = front + back
         importance[gs_in_camera_front[:,0] < -map_size/2] = 0
         importance[gs_in_camera_front[:,0] > map_size/2] = 0
-        importance[gs_in_camera_front[:,2] < -map_size/2] = 0
-        importance[gs_in_camera_front[:,2] > map_size/2] = 0
+        importance[gs_in_camera_front[:,2] < -back] = 0
+        # importance[gs_in_camera_front[:,2] > front] = 0
         # Find mask of num_points points with highest importance
         if num_points > 0:
             _, indices = torch.topk(importance, num_points)
+            assert len(indices) == num_points, f"Expected {num_points} points, got {len(indices)}"
             gs_mask = torch.zeros_like(importance, dtype=torch.bool)
             gs_mask[indices] = True
         else:
             gs_mask = importance > 0
-        if vis:
+        if vis_dir:
             plt.scatter(self.gs._means[gs_mask, 0].detach().cpu().numpy(), self.gs._means[gs_mask, 2].detach().cpu().numpy())
-            corners = torch.tensor([[-map_size/2, 0, -map_size/2], [map_size/2, 0, -map_size/2], [map_size/2, 0, map_size/2], [-map_size/2, 0, map_size/2], [-map_size/2, 0, -map_size/2]], device=self.gs._means.device)
+            corners = torch.tensor([[-map_size/2, 0, back], [map_size/2, 0, back], [map_size/2, 0, front], [-map_size/2, 0, front], [-map_size/2, 0, -back]], device=self.gs._means.device)
             corners_in_world = torch.matmul(self.camera_front_to_world, torch.cat([corners, torch.ones((corners.shape[0], 1), device=corners.device)], dim=-1).T).T[:, :3]
             plt.plot(corners_in_world.cpu().numpy()[:, 0], corners_in_world.cpu().numpy()[:, 2], 'k', linewidth=5)
             plt.grid(True)
             plt.axis('scaled')
-            bev_dir = os.path.join(self.log_dir, "bev")
+            bev_dir = os.path.join(vis_dir, self.dataset.scene_idx)
             os.makedirs(bev_dir, exist_ok=True)
             plt.savefig(os.path.join(bev_dir, f"gs_{frame}.png"))
             plt.close()
@@ -453,42 +455,44 @@ class Model:
         merged_frame = to8b(np.concatenate(merged_list, axis=0))
         return merged_frame   
 
-    def process_all_frames(self, map_size, num_points=0, save=False, render=False, vis=False, num_cams=6):
+    def process_all_frames(self, front, back, num_points=0, save_dir='', render_dir='', vis_dir='', num_cams=6):
         print(f"Processing {self.num_timesteps} frames")
-        print(f"Map size: {map_size}")
+        print(f"Front: {front}, Back: {back}, Left: {(front + back) // 2}, Right: {(front + back) // 2}")
         print("Prune points outside map" if num_points == 0 else f"Prune to {num_points} points")
-        print("Save framewise splats" if save else "Do not save framewise splats")
-        print("Render splats as video" if render else "Do not render splats")
-        print("Visualize BEV Gaussian points" if vis else "Do not visualize BEV Gaussian points")
+        print(f"Save framewise splats under {save_dir}" if save_dir else "Do not save framewise splats")
+        print(f"Render splats as video under {render_dir}" if render_dir else "Do not render splats")
+        print(f"Visualize BEV Gaussian points under {vis_dir}" if vis_dir else "Do not visualize BEV Gaussian points")
 
-        save_model_dir = os.path.join(self.log_dir, f"pruned_{num_points}_{map_size}")
+        scene_idx = self.dataset.scene_idx
         
-        if not os.path.exists(save_model_dir):
-            os.makedirs(save_model_dir)
-        if render:
-            save_video_path = os.path.join(self.log_dir, f"rendered_{num_points}_{map_size}.mp4")
+        if render_dir:
+            save_video_dir = os.path.join(render_dir, f"{num_points}_{front}_{back}")
+            os.makedirs(save_video_dir, exist_ok=True)
+            save_video_path = os.path.join(save_video_dir, f"{scene_idx}.mp4")
             writer = imageio.get_writer(save_video_path, mode="I", fps=10)
         for i in trange(self.num_timesteps, desc="Processing", dynamic_ncols=True):
-            mask = self.prune_frame(i, num_cams, num_points, map_size, vis)
+            mask = self.prune_frame(i, num_cams, num_points, front, back, vis_dir)
             gs = self.gs[mask]
-
-            if save:
+            if save_dir:
+                save_model_dir = os.path.join(save_dir, f"{num_points}_{front}_{back}", str(scene_idx))
+                os.makedirs(save_model_dir, exist_ok=True)
                 save_pth = os.path.join(save_model_dir, f"frame_{i}.ply")
                 self.save_frame(gs, save_pth)
-            if render:
+            if render_dir:
                 merged_frame = self.render_frame(i, gs, num_cams)
                 writer.append_data(merged_frame)
-        if render:
+        if render_dir:
             writer.close()
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Render from checkpoint")
     parser.add_argument('model', type=str, help='Path to the model checkpoint to load')
-    parser.add_argument('--map_size', '-m', type=int, default=200, help='Size of the map')
+    parser.add_argument('--front', '-f', type=int, default=100, help='Size of the map to the front')
+    parser.add_argument('--back', '-b', type=int, default=100, help='Size of the map to the back')
     parser.add_argument('--num-points', '-n', type=int, default=0, help='Number of points to prune to')
-    parser.add_argument('--save', '-s', action='store_true', help='Save the splats')
-    parser.add_argument('--render', '-r', action='store_true', help='Render the splats')
-    parser.add_argument('--vis', '-v', action='store_true', help='Visualize the BEV Gaussian points')
+    parser.add_argument('--save', '-s', type=str, help='Path to save the splats')
+    parser.add_argument('--render', '-r', type=str, help='Path to render the splats')
+    parser.add_argument('--vis', '-v', type=str, help='Path to visualize the BEV Gaussian points')
     return parser.parse_args()
 
 
@@ -503,4 +507,4 @@ if __name__ == "__main__":
     dataset = Dataset(cfg.data)
     model = Model(cfg, dataset)
     model.resume_from_checkpoint(model_path)
-    model.process_all_frames(map_size=args.map_size, num_points=args.num_points, save=args.save, render=args.render, vis=args.vis)
+    model.process_all_frames(front=args.front, back=args.back,num_points=args.num_points, save_dir=args.save, render_dir=args.render, vis_dir=args.vis)
