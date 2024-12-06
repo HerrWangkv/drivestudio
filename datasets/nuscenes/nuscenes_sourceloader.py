@@ -304,7 +304,7 @@ class NuScenesPixelSource(ScenePixelSource):
                             "frame_valid": torch.zeros((frame_num), dtype=torch.bool)
                         }
                         smpl_human_all[instance_id]["smpl_quats"][:, :, 0] = 1.0
-                    if ins_smpl["valid_mask"][fi]:
+                    if ins_smpl["valid_mask"][fi] and fi in instances_info[str(instance_id)]['frame_annotations']["frame_idx"]:
                         betas = ins_smpl["smpl"]["betas"][fi]
                         smpl_human_all[instance_id]["smpl_betas"][fi - self.start_timestep] = betas
                         

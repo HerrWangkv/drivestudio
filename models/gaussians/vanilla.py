@@ -457,7 +457,7 @@ class VanillaGaussians(nn.Module):
             if self.step % step_interval == 0:
                 # scale regularization
                 scale_exp = self.get_scaling
-                scale_reg = torch.maximum(scale_exp.amax(dim=-1) / scale_exp.amin(dim=-1), torch.tensor(max_gauss_ratio)) - max_gauss_ratio
+                scale_reg = torch.maximum(scale_exp.amax(dim=-1) / (scale_exp.amin(dim=-1) + 1e-6), torch.tensor(max_gauss_ratio)) - max_gauss_ratio
                 scale_reg = scale_reg.mean() * w
                 loss_dict["sharp_shape_reg"] = scale_reg
 
