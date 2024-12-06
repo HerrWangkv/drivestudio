@@ -252,7 +252,6 @@ class Gaussian:
 
 def export_ply(gaussian, out_path):
     xyz = gaussian.means
-    normals = np.zeros_like(xyz)
     f_dc = gaussian.features_dc.reshape((gaussian.features_dc.shape[0], -1))
     f_rest = gaussian.features_rest.reshape((gaussian.features_rest.shape[0], -1))
     opacities = gaussian.opacities
@@ -260,7 +259,7 @@ def export_ply(gaussian, out_path):
     rotation = gaussian.quats
 
     def construct_list_of_attributes(gaussian):
-        l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
+        l = ['x', 'y', 'z']
         # All channels except the 3 DC
         for i in range(3):
             l.append('f_dc_{}'.format(i))
@@ -274,7 +273,7 @@ def export_ply(gaussian, out_path):
         return l
 
     dtype_full = [(attribute, 'f4') for attribute in construct_list_of_attributes(gaussian)]
-    attribute_list = [xyz, normals, f_dc, f_rest, opacities, scale, rotation]
+    attribute_list = [xyz, f_dc, f_rest, opacities, scale, rotation]
 
     elements = np.empty(xyz.shape[0], dtype=dtype_full)
     attributes = np.concatenate(attribute_list, axis=1)

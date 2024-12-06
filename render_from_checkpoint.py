@@ -351,7 +351,7 @@ class Model:
         }        
         return results
 
-    def prune_frame(self, frame, num_cams, num_points, front, back, vis_dir=''):
+    def prune_frame(self, frame, num_cams, num_points, front=100, back=100, vis_dir=''):
         importance = None
         for idx in range(frame*num_cams, (frame+1)*num_cams):
             image_infos, camera_infos = self.dataset.get_image(idx)
@@ -390,12 +390,12 @@ class Model:
             )
             importance += single_importance
         # Prune Gaussians outside the map
-        gs_homogeneous = torch.cat([self.gs._means, torch.ones((self.gs._means.shape[0], 1), device=self.gs._means.device)], dim=-1)
-        gs_in_camera_front = torch.matmul(self.to_camera_front, gs_homogeneous.T).T[:, :3]
+        # gs_homogeneous = torch.cat([self.gs._means, torch.ones((self.gs._means.shape[0], 1), device=self.gs._means.device)], dim=-1)
+        # gs_in_camera_front = torch.matmul(self.to_camera_front, gs_homogeneous.T).T[:, :3]
         map_size = front + back
-        importance[gs_in_camera_front[:,0] < -map_size/2] = 0
-        importance[gs_in_camera_front[:,0] > map_size/2] = 0
-        importance[gs_in_camera_front[:,2] < -back] = 0
+        # importance[gs_in_camera_front[:,0] < -map_size/2] = 0
+        # importance[gs_in_camera_front[:,0] > map_size/2] = 0
+        # importance[gs_in_camera_front[:,2] < -back] = 0
         # importance[gs_in_camera_front[:,2] > front] = 0
         # Find mask of num_points points with highest importance
         if num_points > 0:
@@ -407,12 +407,12 @@ class Model:
             gs_mask = importance > 0
         if vis_dir:
             plt.scatter(self.gs._means[gs_mask, 0].detach().cpu().numpy(), self.gs._means[gs_mask, 2].detach().cpu().numpy())
-            corners = torch.tensor([[-map_size/2, 0, back], [map_size/2, 0, back], [map_size/2, 0, front], [-map_size/2, 0, front], [-map_size/2, 0, -back]], device=self.gs._means.device)
+            corners = torch.tensor([[-map_size/2, 0, -back], [map_size/2, 0, -back], [map_size/2, 0, front], [-map_size/2, 0, front], [-map_size/2, 0, -back]], device=self.gs._means.device)
             corners_in_world = torch.matmul(self.camera_front_to_world, torch.cat([corners, torch.ones((corners.shape[0], 1), device=corners.device)], dim=-1).T).T[:, :3]
             plt.plot(corners_in_world.cpu().numpy()[:, 0], corners_in_world.cpu().numpy()[:, 2], 'k', linewidth=5)
             plt.grid(True)
             plt.axis('scaled')
-            bev_dir = os.path.join(vis_dir, self.dataset.scene_idx)
+            bev_dir = os.path.join(vis_dir, str(self.dataset.scene_idx))
             os.makedirs(bev_dir, exist_ok=True)
             plt.savefig(os.path.join(bev_dir, f"gs_{frame}.png"))
             plt.close()
@@ -421,7 +421,7 @@ class Model:
     def downsample_frame(self, mask, num_points):
         return self.gs[mask].farthest_point_sample(num_points)
     
-    def save_frame(gs, save_pth):
+    def save_frame(self, gs, save_pth):
         export_ply(gs, save_pth)
 
     def render_frame(self, frame, gs, num_cams):
@@ -455,10 +455,10 @@ class Model:
         merged_frame = to8b(np.concatenate(merged_list, axis=0))
         return merged_frame   
 
-    def process_all_frames(self, front, back, num_points=0, save_dir='', render_dir='', vis_dir='', num_cams=6):
+    def process_all_frames(self, front=100, back=100, num_points=0, save_dir='', render_dir='', vis_dir='', num_cams=6):
         print(f"Processing {self.num_timesteps} frames")
-        print(f"Front: {front}, Back: {back}, Left: {(front + back) // 2}, Right: {(front + back) // 2}")
-        print("Prune points outside map" if num_points == 0 else f"Prune to {num_points} points")
+        # print(f"Front: {front}, Back: {back}, Left: {(front + back) // 2}, Right: {(front + back) // 2}")
+        print("Prune points outside frustums" if num_points == 0 else f"Prune to {num_points} points")
         print(f"Save framewise splats under {save_dir}" if save_dir else "Do not save framewise splats")
         print(f"Render splats as video under {render_dir}" if render_dir else "Do not render splats")
         print(f"Visualize BEV Gaussian points under {vis_dir}" if vis_dir else "Do not visualize BEV Gaussian points")
@@ -466,7 +466,7 @@ class Model:
         scene_idx = self.dataset.scene_idx
         
         if render_dir:
-            save_video_dir = os.path.join(render_dir, f"{num_points}_{front}_{back}")
+            save_video_dir = os.path.join(render_dir, f"{num_points}")
             os.makedirs(save_video_dir, exist_ok=True)
             save_video_path = os.path.join(save_video_dir, f"{scene_idx}.mp4")
             writer = imageio.get_writer(save_video_path, mode="I", fps=10)
@@ -474,7 +474,7 @@ class Model:
             mask = self.prune_frame(i, num_cams, num_points, front, back, vis_dir)
             gs = self.gs[mask]
             if save_dir:
-                save_model_dir = os.path.join(save_dir, f"{num_points}_{front}_{back}", str(scene_idx))
+                save_model_dir = os.path.join(save_dir, f"{num_points}", str(scene_idx))
                 os.makedirs(save_model_dir, exist_ok=True)
                 save_pth = os.path.join(save_model_dir, f"frame_{i}.ply")
                 self.save_frame(gs, save_pth)
@@ -487,8 +487,8 @@ class Model:
 def parse_args():
     parser = argparse.ArgumentParser(description="Render from checkpoint")
     parser.add_argument('model', type=str, help='Path to the model checkpoint to load')
-    parser.add_argument('--front', '-f', type=int, default=100, help='Size of the map to the front')
-    parser.add_argument('--back', '-b', type=int, default=100, help='Size of the map to the back')
+    # parser.add_argument('--front', '-f', type=int, default=100, help='Size of the map to the front')
+    # parser.add_argument('--back', '-b', type=int, default=100, help='Size of the map to the back')
     parser.add_argument('--num-points', '-n', type=int, default=0, help='Number of points to prune to')
     parser.add_argument('--save', '-s', type=str, help='Path to save the splats')
     parser.add_argument('--render', '-r', type=str, help='Path to render the splats')
@@ -507,4 +507,4 @@ if __name__ == "__main__":
     dataset = Dataset(cfg.data)
     model = Model(cfg, dataset)
     model.resume_from_checkpoint(model_path)
-    model.process_all_frames(front=args.front, back=args.back,num_points=args.num_points, save_dir=args.save, render_dir=args.render, vis_dir=args.vis)
+    model.process_all_frames(num_points=args.num_points, save_dir=args.save, render_dir=args.render, vis_dir=args.vis)
