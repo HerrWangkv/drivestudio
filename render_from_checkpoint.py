@@ -98,7 +98,7 @@ class Model:
         self.num_full_images = len(dataset.full_image_set)
         self.num_gs_points = 0
         self.max_num_per_frame = 0
-        gs = None
+        self.gs = None
         
         # init scene scale
         self._init_scene(scene_aabb=dataset.aabb)
@@ -249,7 +249,7 @@ class Model:
         
         return camera_dict
 
-    def collect_gaussians(self) -> dataclass_gs:
+    def collect_gaussians(self, cam_front_centered=False) -> dataclass_gs:
         gs_dict = {
             "_means": [],
             "_features_dc": [],
@@ -275,6 +275,10 @@ class Model:
         elif self.num_gs_points != len(self.gs._means):
             print(f"self.num_gs_points changes from {self.num_gs_points} to {len(self.gs._means)}")
             self.num_gs_points = len(self.gs._means)
+        if cam_front_centered:
+            gs_in_cam_front = torch.cat([self.gs._means, torch.ones((self.gs._means.shape[0], 1), device=self.gs._means.device)], dim=-1) @ self.world_to_camera_front.T
+            gs_in_cam_front = gs_in_cam_front[:, :3]
+            self.gs._means = gs_in_cam_front
     
     def sort_gaussians(
         self,
@@ -351,14 +355,14 @@ class Model:
         }        
         return results
 
-    def prune_frame(self, frame, num_cams, num_points, front=100, back=100, vis_dir=''):
+    def prune_frame(self, frame, num_cams, num_points, front=100, back=100, vis_dir='', cam_front_centered=False):
         importance = None
         for idx in range(frame*num_cams, (frame+1)*num_cams):
             image_infos, camera_infos = self.dataset.get_image(idx)
             if camera_infos['cam_name'] == 'CAM_FRONT':
                 assert idx % num_cams == 0, f"Expected idx to be a multiple of {num_cams}, got {idx}"
                 self.camera_front_to_world = camera_infos['camera_to_world']
-                self.to_camera_front = torch.linalg.inv(camera_infos['camera_to_world'])
+                self.world_to_camera_front = torch.linalg.inv(self.camera_front_to_world)
             for k, v in image_infos.items():
                 if isinstance(v, Tensor):
                     image_infos[k] = v.cuda(non_blocking=True)
@@ -379,7 +383,7 @@ class Model:
                 image_ids=image_infos["img_idx"].flatten()[0],
             )
 
-            self.collect_gaussians()
+            self.collect_gaussians(cam_front_centered)
             if importance is None:
                 importance = torch.zeros(self.gs._means.shape[0], device=self.gs._means.device)
             single_importance = self.sort_gaussians(
@@ -391,7 +395,7 @@ class Model:
             importance += single_importance
         # Prune Gaussians outside the map
         # gs_homogeneous = torch.cat([self.gs._means, torch.ones((self.gs._means.shape[0], 1), device=self.gs._means.device)], dim=-1)
-        # gs_in_camera_front = torch.matmul(self.to_camera_front, gs_homogeneous.T).T[:, :3]
+        # gs_in_camera_front = torch.matmul(self.world_to_camera_front, gs_homogeneous.T).T[:, :3]
         map_size = front + back
         # importance[gs_in_camera_front[:,0] < -map_size/2] = 0
         # importance[gs_in_camera_front[:,0] > map_size/2] = 0
@@ -459,7 +463,7 @@ class Model:
         print(f"Processing {self.num_timesteps} frames")
         # print(f"Front: {front}, Back: {back}, Left: {(front + back) // 2}, Right: {(front + back) // 2}")
         print("Prune points outside frustums" if num_points == 0 else f"Prune to {num_points} points")
-        print(f"Save framewise splats under {save_dir}" if save_dir else "Do not save framewise splats")
+        print(f"Save framewise camera front centered splats under {save_dir}" if save_dir else "Do not save framewise splats")
         print(f"Render splats as video under {render_dir}" if render_dir else "Do not render splats")
         print(f"Visualize BEV Gaussian points under {vis_dir}" if vis_dir else "Do not visualize BEV Gaussian points")
 
@@ -471,7 +475,7 @@ class Model:
             save_video_path = os.path.join(save_video_dir, f"{scene_idx}.mp4")
             writer = imageio.get_writer(save_video_path, mode="I", fps=10)
         for i in trange(self.num_timesteps, desc="Processing", dynamic_ncols=True):
-            mask = self.prune_frame(i, num_cams, num_points, front, back, vis_dir)
+            mask = self.prune_frame(i, num_cams, num_points, front, back, vis_dir, cam_front_centered=True if save_dir else False)
             gs = self.gs[mask]
             if save_dir:
                 save_model_dir = os.path.join(save_dir, f"{num_points}", str(scene_idx))
