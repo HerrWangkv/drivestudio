@@ -207,7 +207,7 @@ class Gaussian:
     def __init__(self, gaussian):
         self._means = gaussian['_means']
         self._features_dc = gaussian['_features_dc']
-        self._features_rest = gaussian['_features_rest']
+        # self._features_rest = gaussian['_features_rest']
         self._opacities = gaussian['_opacities']
         self._scales = gaussian['_scales']
         self._quats = gaussian['_quats']
@@ -217,9 +217,9 @@ class Gaussian:
     @property
     def features_dc(self):
         return self._features_dc.detach().cpu().numpy()
-    @property
-    def features_rest(self):
-        return self._features_rest.detach().cpu().numpy()
+    # @property
+    # def features_rest(self):
+    #     return self._features_rest.detach().cpu().numpy()
     @property
     def opacities(self):
         return self._opacities.detach().cpu().numpy()
@@ -231,7 +231,7 @@ class Gaussian:
         return self._quats.detach().cpu().numpy()
     
     def __len__(self):
-        assert self._means.shape[0] == self._features_dc.shape[0] == self._features_rest.shape[0] == self._opacities.shape[0] == self._scales.shape[0] == self._quats.shape[0]
+        assert self._means.shape[0] == self._features_dc.shape[0] == self._opacities.shape[0] == self._scales.shape[0] == self._quats.shape[0]# == self._features_rest.shape[0]
         return self._means.shape[0]
 
     def __getitem__(self, mask):
@@ -239,12 +239,25 @@ class Gaussian:
             {
                 '_means': self._means[mask],
                 '_features_dc': self._features_dc[mask],
-                '_features_rest': self._features_rest[mask],
+                # '_features_rest': self._features_rest[mask],
                 '_opacities': self._opacities[mask],
                 '_scales': self._scales[mask],
                 '_quats': self._quats[mask],
             }
         )
+    
+    def __copy__(self):
+        return Gaussian(
+            {
+                '_means': self._means.clone(),
+                '_features_dc': self._features_dc,
+                # '_features_rest': self._features_rest,
+                '_opacities': self._opacities,
+                '_scales': self._scales,
+                '_quats': self._quats,
+            }
+        )
+
     def farthest_point_sample(self, num_points):
         _, indices = sample_farthest_points(self._means.unsqueeze(0), K=num_points, random_start_point=True)
         return self[indices[0].cpu().numpy()]
@@ -253,7 +266,7 @@ class Gaussian:
 def export_ply(gaussian, out_path):
     xyz = gaussian.means
     f_dc = gaussian.features_dc.reshape((gaussian.features_dc.shape[0], -1))
-    f_rest = gaussian.features_rest.reshape((gaussian.features_rest.shape[0], -1))
+    # f_rest = gaussian.features_rest.reshape((gaussian.features_rest.shape[0], -1))
     opacities = gaussian.opacities
     scale = gaussian.scales
     rotation = gaussian.quats
@@ -263,17 +276,17 @@ def export_ply(gaussian, out_path):
         # All channels except the 3 DC
         for i in range(3):
             l.append('f_dc_{}'.format(i))
-        for i in range(45):
-            l.append('f_rest_{}'.format(i))
         l.append('opacity')
         for i in range(gaussian.scales.shape[1]):
             l.append('scale_{}'.format(i))
         for i in range(gaussian.quats.shape[1]):
             l.append('rot_{}'.format(i))
+        # for i in range(45):
+        #     l.append('f_rest_{}'.format(i))
         return l
 
     dtype_full = [(attribute, 'f4') for attribute in construct_list_of_attributes(gaussian)]
-    attribute_list = [xyz, f_dc, f_rest, opacities, scale, rotation]
+    attribute_list = [xyz, f_dc, opacities, scale, rotation]#, f_rest]
 
     elements = np.empty(xyz.shape[0], dtype=dtype_full)
     attributes = np.concatenate(attribute_list, axis=1)

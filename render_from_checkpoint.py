@@ -2,7 +2,7 @@ import os
 import torch
 import argparse
 import imageio
-
+import copy
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -249,11 +249,11 @@ class Model:
         
         return camera_dict
 
-    def collect_gaussians(self, cam_front_centered=False) -> dataclass_gs:
+    def collect_gaussians(self) -> dataclass_gs:
         gs_dict = {
             "_means": [],
             "_features_dc": [],
-            "_features_rest": [],
+            # "_features_rest": [],
             "_opacities": [],
             "_scales": [],
             "_quats": [],
@@ -264,7 +264,7 @@ class Model:
                 continue
     
             # collect gaussians
-            for k, _ in gs.items():
+            for k, _ in gs_dict.items():
                 gs_dict[k].append(gs[k])
         
         for k, v in gs_dict.items():
@@ -275,10 +275,10 @@ class Model:
         elif self.num_gs_points != len(self.gs._means):
             print(f"self.num_gs_points changes from {self.num_gs_points} to {len(self.gs._means)}")
             self.num_gs_points = len(self.gs._means)
-        if cam_front_centered:
-            gs_in_cam_front = torch.cat([self.gs._means, torch.ones((self.gs._means.shape[0], 1), device=self.gs._means.device)], dim=-1) @ self.world_to_camera_front.T
-            gs_in_cam_front = gs_in_cam_front[:, :3]
-            self.gs._means = gs_in_cam_front
+        # if cam_front_centered:
+        #     gs_in_cam_front = torch.cat([self.gs._means, torch.ones((self.gs._means.shape[0], 1), device=self.gs._means.device)], dim=-1) @ self.world_to_camera_front.T
+        #     gs_in_cam_front = gs_in_cam_front[:, :3]
+        #     self.gs._means = gs_in_cam_front
     
     def sort_gaussians(
         self,
@@ -303,11 +303,14 @@ class Model:
         return importance
     
     def return_colors(self, gs: Gaussian, cam: dataclass_camera):
-        colors = torch.cat([gs._features_dc[:, None, :], gs._features_rest], dim=1)
-        viewdirs = gs._means.detach() - cam.camtoworlds.data[..., :3, 3]  # (N, 3)
-        viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
-        rgbs = spherical_harmonics(3, viewdirs, colors)
-        rgbs = torch.clamp(rgbs + 0.5, 0.0, 1.0)
+        if "_features_rest" not in gs.__dict__:
+            rgbs = torch.sigmoid(gs._features_dc)
+        else:
+            colors = torch.cat([gs._features_dc[:, None, :], gs._features_rest], dim=1)
+            viewdirs = gs._means.detach() - cam.camtoworlds.data[..., :3, 3]  # (N, 3)
+            viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
+            rgbs = spherical_harmonics(3, viewdirs, colors)
+            rgbs = torch.clamp(rgbs + 0.5, 0.0, 1.0)
         return rgbs
 
     def render_gaussians(
@@ -355,7 +358,7 @@ class Model:
         }        
         return results
 
-    def prune_frame(self, frame, num_cams, num_points, front=100, back=100, vis_dir='', cam_front_centered=False):
+    def prune_frame(self, frame, num_cams, num_points, vis_dir='', front=100, back=-100, top=8, bottom=-2):
         importance = None
         for idx in range(frame*num_cams, (frame+1)*num_cams):
             image_infos, camera_infos = self.dataset.get_image(idx)
@@ -383,7 +386,7 @@ class Model:
                 image_ids=image_infos["img_idx"].flatten()[0],
             )
 
-            self.collect_gaussians(cam_front_centered)
+            self.collect_gaussians()
             if importance is None:
                 importance = torch.zeros(self.gs._means.shape[0], device=self.gs._means.device)
             single_importance = self.sort_gaussians(
@@ -394,13 +397,15 @@ class Model:
             )
             importance += single_importance
         # Prune Gaussians outside the map
-        # gs_homogeneous = torch.cat([self.gs._means, torch.ones((self.gs._means.shape[0], 1), device=self.gs._means.device)], dim=-1)
-        # gs_in_camera_front = torch.matmul(self.world_to_camera_front, gs_homogeneous.T).T[:, :3]
-        map_size = front + back
-        # importance[gs_in_camera_front[:,0] < -map_size/2] = 0
-        # importance[gs_in_camera_front[:,0] > map_size/2] = 0
-        # importance[gs_in_camera_front[:,2] < -back] = 0
-        # importance[gs_in_camera_front[:,2] > front] = 0
+        map_size = front - back
+        gs_homogeneous = torch.cat([self.gs._means, torch.ones((self.gs._means.shape[0], 1), device=self.gs._means.device)], dim=-1)
+        gs_in_camera_front = torch.matmul(self.world_to_camera_front, gs_homogeneous.T).T[:, :3]
+        importance[gs_in_camera_front[:,0] < -map_size/2] = 0
+        importance[gs_in_camera_front[:,0] > map_size/2] = 0
+        importance[gs_in_camera_front[:,2] < back] = 0
+        importance[gs_in_camera_front[:,2] > front] = 0
+        importance[gs_in_camera_front[:,1] < -top] = 0
+        importance[gs_in_camera_front[:,1] > -bottom] = 0
         # Find mask of num_points points with highest importance
         if num_points > 0:
             _, indices = torch.topk(importance, num_points)
@@ -411,7 +416,7 @@ class Model:
             gs_mask = importance > 0
         if vis_dir:
             plt.scatter(self.gs._means[gs_mask, 0].detach().cpu().numpy(), self.gs._means[gs_mask, 2].detach().cpu().numpy())
-            corners = torch.tensor([[-map_size/2, 0, -back], [map_size/2, 0, -back], [map_size/2, 0, front], [-map_size/2, 0, front], [-map_size/2, 0, -back]], device=self.gs._means.device)
+            corners = torch.tensor([[-map_size/2, 0, back], [map_size/2, 0, back], [map_size/2, 0, front], [-map_size/2, 0, front], [-map_size/2, 0, back]], device=self.gs._means.device)
             corners_in_world = torch.matmul(self.camera_front_to_world, torch.cat([corners, torch.ones((corners.shape[0], 1), device=corners.device)], dim=-1).T).T[:, :3]
             plt.plot(corners_in_world.cpu().numpy()[:, 0], corners_in_world.cpu().numpy()[:, 2], 'k', linewidth=5)
             plt.grid(True)
@@ -459,10 +464,10 @@ class Model:
         merged_frame = to8b(np.concatenate(merged_list, axis=0))
         return merged_frame   
 
-    def process_all_frames(self, front=100, back=100, num_points=0, save_dir='', render_dir='', vis_dir='', num_cams=6):
+    def process_all_frames(self, num_points=0, save_dir='', render_dir='', vis_dir='', num_cams=6, front=100, back=-100, top=8, bottom=-2):
         print(f"Processing {self.num_timesteps} frames")
-        # print(f"Front: {front}, Back: {back}, Left: {(front + back) // 2}, Right: {(front + back) // 2}")
-        print("Prune points outside frustums" if num_points == 0 else f"Prune to {num_points} points")
+        print(f"Front: {front}, Back: {back}, Left: {-(front - back) // 2}, Right: {(front - back) // 2}, Top: {top}, Bottom: {bottom}")
+        print("Prune points outside the map" if num_points == 0 else f"Prune to {num_points} points")
         print(f"Save framewise camera front centered splats under {save_dir}" if save_dir else "Do not save framewise splats")
         print(f"Render splats as video under {render_dir}" if render_dir else "Do not render splats")
         print(f"Visualize BEV Gaussian points under {vis_dir}" if vis_dir else "Do not visualize BEV Gaussian points")
@@ -470,18 +475,21 @@ class Model:
         scene_idx = self.dataset.scene_idx
         
         if render_dir:
-            save_video_dir = os.path.join(render_dir, f"{num_points}")
+            save_video_dir = os.path.join(render_dir, f"{num_points}_{back}_{front}_{-top}_{-bottom}")
             os.makedirs(save_video_dir, exist_ok=True)
             save_video_path = os.path.join(save_video_dir, f"{scene_idx}.mp4")
             writer = imageio.get_writer(save_video_path, mode="I", fps=10)
         for i in trange(self.num_timesteps, desc="Processing", dynamic_ncols=True):
-            mask = self.prune_frame(i, num_cams, num_points, front, back, vis_dir, cam_front_centered=True if save_dir else False)
+            mask = self.prune_frame(i, num_cams, num_points, vis_dir, front, back, top, bottom)
             gs = self.gs[mask]
             if save_dir:
-                save_model_dir = os.path.join(save_dir, f"{num_points}", str(scene_idx))
+                cam_front_centered_gs = copy.copy(gs)
+                tmp = torch.cat([gs._means, torch.ones((gs._means.shape[0], 1), device=gs._means.device)], dim=-1) @ self.world_to_camera_front.T
+                cam_front_centered_gs._means = tmp[:, :3]
+                save_model_dir = os.path.join(save_dir, f"{num_points}_{back}_{front}_{-top}_{-bottom}", str(scene_idx))
                 os.makedirs(save_model_dir, exist_ok=True)
                 save_pth = os.path.join(save_model_dir, f"frame_{i}.ply")
-                self.save_frame(gs, save_pth)
+                self.save_frame(cam_front_centered_gs, save_pth)
             if render_dir:
                 merged_frame = self.render_frame(i, gs, num_cams)
                 writer.append_data(merged_frame)
@@ -491,8 +499,10 @@ class Model:
 def parse_args():
     parser = argparse.ArgumentParser(description="Render from checkpoint")
     parser.add_argument('model', type=str, help='Path to the model checkpoint to load')
-    # parser.add_argument('--front', '-f', type=int, default=100, help='Size of the map to the front')
-    # parser.add_argument('--back', '-b', type=int, default=100, help='Size of the map to the back')
+    parser.add_argument('--front', '-f', type=int, default=100, help='Size of the map to the front')
+    parser.add_argument('--back', '-b', type=int, default=-100, help='Size of the map to the back')
+    parser.add_argument('--top', '-t', type=int, default=8, help='Size of the map to the top')
+    parser.add_argument('--bottom', '-m', type=int, default=-2, help='Size of the map to the bottom')
     parser.add_argument('--num-points', '-n', type=int, default=0, help='Number of points to prune to')
     parser.add_argument('--save', '-s', type=str, help='Path to save the splats')
     parser.add_argument('--render', '-r', type=str, help='Path to render the splats')
@@ -511,4 +521,4 @@ if __name__ == "__main__":
     dataset = Dataset(cfg.data)
     model = Model(cfg, dataset)
     model.resume_from_checkpoint(model_path)
-    model.process_all_frames(num_points=args.num_points, save_dir=args.save, render_dir=args.render, vis_dir=args.vis)
+    model.process_all_frames(num_points=args.num_points, save_dir=args.save, render_dir=args.render, vis_dir=args.vis, front=args.front, back=args.back, top=args.top, bottom=args.bottom)
