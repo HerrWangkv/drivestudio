@@ -408,6 +408,7 @@ class Model:
         importance[gs_in_camera_front[:,1] > -bottom] = 0
         # Find mask of num_points points with highest importance
         if num_points > 0:
+            assert num_points <= len(importance), f"Expected at least {num_points} splats, got {len(importance)}"
             _, indices = torch.topk(importance, num_points)
             assert len(indices) == num_points, f"Expected {num_points} points, got {len(indices)}"
             gs_mask = torch.zeros_like(importance, dtype=torch.bool)
