@@ -147,6 +147,8 @@ class RigidNodes(VanillaGaussians):
                 if self.step < self.ctrl_cfg.stop_screen_size_at:
                     splits |= (self.max_2Dsize > self.ctrl_cfg.split_screen_size).squeeze()
                 splits &= high_grads
+                if len(splits.shape) == 0:
+                    splits = splits.unsqueeze(0)
                 nsamps = self.ctrl_cfg.n_split_samples
                 (
                     split_means,
