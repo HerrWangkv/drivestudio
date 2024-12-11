@@ -165,6 +165,8 @@ class RigidNodes(VanillaGaussians):
                         self.ctrl_cfg.densify_size_thresh * self.scene_scale
                 ).squeeze()
                 dups &= high_grads
+                if len(dups.shape) == 0:
+                    dups = dups.unsqueeze(0)
                 (
                     dup_means,
                     dup_feature_dc,
