@@ -233,6 +233,8 @@ class RigidNodes(VanillaGaussians):
         n_bef = self.num_points
         # cull transparent ones
         culls = (self.get_opacity.data < self.ctrl_cfg.cull_alpha_thresh).squeeze()
+        if len(culls.shape) == 0:
+            culls = culls.unsqueeze(0)
         if self.ctrl_cfg.cull_out_of_bound:
             culls = culls | self.get_out_of_bound_mask()
         if self.step > self.ctrl_cfg.reset_alpha_interval:

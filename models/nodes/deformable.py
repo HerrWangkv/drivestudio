@@ -43,6 +43,8 @@ class DeformableNodes(RigidNodes):
         x = local_means.data / ins_height[:, None] * 2
         t = self.normalized_timestamps[self.cur_frame]
         t = t.unsqueeze(0).repeat(self.point_ids.shape[0], 1)
+        if (len(x.shape) == len(t.shape) + 1):
+            t = t.unsqueeze(0)
         delta_xyz, delta_quat, delta_scale = self.deform_network(x, t, nonrigid_embed)
         return delta_xyz, delta_quat, delta_scale
     
