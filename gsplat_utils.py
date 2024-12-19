@@ -262,14 +262,31 @@ class Gaussian:
         _, indices = sample_farthest_points(self._means.unsqueeze(0), K=num_points, random_start_point=True)
         return self[indices[0].cpu().numpy()]
 
+def standardize_rotation(rots):
+    '''
+    Different quaternions can represent the same orientation. This function standardizes the rotations.
+    Args:
+        rots: np.array of shape (N, 4)
+    Returns:
+        standard_rots: np.array of shape (N, 4)    
+    '''
+    permutations = np.array([[0, 1, 2, 3], [1, 0, 3, 2], [2, 3, 0, 1], [3, 2, 1, 0]])
+    symbols = np.array([[1, 1, 1, 1], [-1, 1, 1, -1], [-1, -1, 1, 1], [-1, 1, -1, 1]])
+    rots_abs = np.abs(rots)
+    max_idx = np.argmax(rots_abs, axis=1)
+    standard_rots = rots[np.arange(len(rots))[:, None], permutations[max_idx]] * symbols[max_idx]
+    tmp = 2 * (standard_rots[:,0] > 0)[:,None] - 1
+    standard_rots *= tmp
+    return standard_rots
+
 
 def export_ply(gaussian, out_path):
     xyz = gaussian.means
     f_dc = gaussian.features_dc.reshape((gaussian.features_dc.shape[0], -1))
     # f_rest = gaussian.features_rest.reshape((gaussian.features_rest.shape[0], -1))
     opacities = gaussian.opacities
-    scale = gaussian.scales
-    rotation = gaussian.quats
+    scales = gaussian.scales
+    rotations = standardize_rotation(gaussian.quats)
 
     def construct_list_of_attributes(gaussian):
         l = ['x', 'y', 'z']
@@ -286,7 +303,7 @@ def export_ply(gaussian, out_path):
         return l
 
     dtype_full = [(attribute, 'f4') for attribute in construct_list_of_attributes(gaussian)]
-    attribute_list = [xyz, f_dc, opacities, scale, rotation]#, f_rest]
+    attribute_list = [xyz, f_dc, opacities, scales, rotations]#, f_rest]
 
     elements = np.empty(xyz.shape[0], dtype=dtype_full)
     attributes = np.concatenate(attribute_list, axis=1)

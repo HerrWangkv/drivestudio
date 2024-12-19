@@ -21,6 +21,17 @@ from datasets.base.split_wrapper import SplitWrapper
 
 class Dataset:
     def __init__(self, data_cfg):
+        if not os.path.exists(data_cfg.data_root):
+            data_roots = ["/mrtstorage/datasets_tmp/nuscenes_kwang", "/hkfs/work/workspace_haic/scratch/xw2723-nuscenes", "/pfs/work8/workspace/ffuc/scratch/xw2723-nuscenes/nuscenes_kwang"]
+            for root in data_roots:
+                if os.path.exists(root):
+                    data_root = root
+            if data_cfg.data_root.startswith("/mrtstorage"):
+                data_cfg.data_root = data_cfg.data_root.replace("/mrtstorage/datasets_tmp/nuscenes_kwang", data_root)
+            elif data_cfg.data_root.startswith("/hkfs"):
+                data_cfg.data_root = data_cfg.data_root.replace("/hkfs/work/workspace_haic/scratch/xw2723-nuscenes", data_root)
+            elif data_cfg.data_root.startswith("/pfs"):
+                data_cfg.data_root = data_cfg.data_root.replace("/pfs/work8/workspace/ffuc/scratch/xw2723-nuscenes/nuscenes_kwang", data_root)
         self.data_cfg = data_cfg
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.data_path = os.path.join(
