@@ -31,3 +31,6 @@ gdown
 
 nerfview==0.0.3
 lpips==0.1.4
+
+plyfile
+nerfacc
