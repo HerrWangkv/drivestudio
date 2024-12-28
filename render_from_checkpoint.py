@@ -422,6 +422,7 @@ class Model:
             assert num_points <= len(importance), f"Expected at least {num_points} splats, got {len(importance)}"
             _, indices = torch.topk(importance, num_points)
             assert len(indices) == num_points, f"Expected {num_points} points, got {len(indices)}"
+            assert importance[indices].min() > 0, f"Expected all points to have positive importance, got {importance[indices].min()}"
             gs_mask = torch.zeros_like(importance, dtype=torch.bool)
             gs_mask[indices] = True
         else:
@@ -513,8 +514,8 @@ def parse_args():
     parser.add_argument('model', type=str, help='Path to the model checkpoint to load')
     parser.add_argument('--front', '-f', type=int, default=100, help='Size of the map to the front')
     parser.add_argument('--back', '-b', type=int, default=-100, help='Size of the map to the back')
-    parser.add_argument('--top', '-t', type=int, default=8, help='Size of the map to the top')
-    parser.add_argument('--bottom', '-m', type=int, default=-2, help='Size of the map to the bottom')
+    parser.add_argument('--top', '-t', type=int, default=15, help='Size of the map to the top')
+    parser.add_argument('--bottom', '-m', type=int, default=-5, help='Size of the map to the bottom')
     parser.add_argument('--num-points', '-n', type=int, default=0, help='Number of points to prune to')
     parser.add_argument('--save', '-s', type=str, help='Path to save the splats')
     parser.add_argument('--render', '-r', type=str, help='Path to render the splats')
