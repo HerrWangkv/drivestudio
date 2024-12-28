@@ -5,6 +5,7 @@ import imageio
 import copy
 import numpy as np
 import matplotlib.pyplot as plt
+import open3d as o3d
 
 from torch import nn, Tensor
 from tqdm import trange
@@ -95,6 +96,18 @@ class Dataset:
     
     def get_image(self, idx) -> dict:
         return self.full_image_set.get_image(idx, camera_downscale=1.0)
+    
+    def get_points(self, idx) -> np.ndarray:
+        file_name = os.path.join(self.data_path, "lidar", f"{idx:03d}.bin")
+        points = np.fromfile(file_name, dtype=np.float32).reshape(-1, 4)
+        points = points[:, :3]
+        lidar_to_world = np.loadtxt(os.path.join(self.data_path, "lidar_pose", f"{idx:03d}.txt"))
+        cam_front_to_world = np.loadtxt(os.path.join(self.data_path, "extrinsics", f"{idx:03d}_0.txt"))
+        world_to_cam_front = np.linalg.inv(cam_front_to_world)
+        lidar_to_cam_front = np.matmul(world_to_cam_front, lidar_to_world)
+        points_homogeneous = np.concatenate([points, np.ones((points.shape[0], 1))], axis=-1)
+        points_in_cam_front = np.matmul(lidar_to_cam_front, points_homogeneous.T).T[:, :3]
+        return points_in_cam_front
     
 class Model:
     def __init__(self, cfg, dataset):
