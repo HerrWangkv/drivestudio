@@ -424,20 +424,21 @@ class Model:
         map_size = front - back
         gs_homogeneous = torch.cat([self.gs._means, torch.ones((self.gs._means.shape[0], 1), device=self.gs._means.device)], dim=-1)
         gs_in_camera_front = torch.matmul(self.world_to_camera_front, gs_homogeneous.T).T[:, :3]
-        importance[gs_in_camera_front[:,0] < -map_size/2] = 0
-        importance[gs_in_camera_front[:,0] > map_size/2] = 0
-        importance[gs_in_camera_front[:,2] < back] = 0
-        importance[gs_in_camera_front[:,2] > front] = 0
-        importance[gs_in_camera_front[:,1] < -top] = 0
-        importance[gs_in_camera_front[:,1] > -bottom] = 0
+        importance[gs_in_camera_front[:,0] < -map_size/2] = -0.1
+        importance[gs_in_camera_front[:,0] > map_size/2] = -0.1
+        importance[gs_in_camera_front[:,2] < back] = -0.1
+        importance[gs_in_camera_front[:,2] > front] = -0.1
+        importance[gs_in_camera_front[:,1] < -top] = -0.1
+        importance[gs_in_camera_front[:,1] > -bottom] = -0.1
+        
         # Find mask of num_points points with highest importance
         if num_points > 0:
             assert num_points <= len(importance), f"Expected at least {num_points} splats, got {len(importance)}"
             _, indices = torch.topk(importance, num_points)
             assert len(indices) == num_points, f"Expected {num_points} points, got {len(indices)}"
-            assert importance[indices].min() > 0, f"Expected all points to have positive importance, got {importance[indices].min()}"
             gs_mask = torch.zeros_like(importance, dtype=torch.bool)
             gs_mask[indices] = True
+            gs_mask[importance < 0] = False
         else:
             gs_mask = importance > 0
         if vis_dir:
@@ -507,7 +508,22 @@ class Model:
             writer = imageio.get_writer(save_video_path, mode="I", fps=10)
         for i in trange(self.num_timesteps, desc="Processing", dynamic_ncols=True):
             mask = self.prune_frame(i, num_cams, num_points, vis_dir, front, back, top, bottom)
+            patched_num = num_points - mask.sum()
             gs = self.gs[mask]
+            if patched_num > 0:
+                cam_front_origin = self.camera_front_to_world[:3, 3]
+                patched_means = cam_front_origin.repeat(patched_num, 1).to(self.gs._means.device)
+                patched_gs_dict = {
+                    "_means": patched_means,
+                    "_features_dc": torch.zeros((patched_num, 3), device=self.gs._means.device),
+                    "_opacities": torch.zeros((patched_num, 1), device=self.gs._means.device),
+                    "_scales": torch.ones((patched_num, 3), device=self.gs._means.device),
+                    "_quats": torch.zeros((patched_num, 4), device=self.gs._means.device)
+                }
+                patched_gs_dict["_quats"][:, 0] = 1
+                patched_gs = Gaussian(patched_gs_dict)
+                gs.concat(patched_gs)
+            
             if save_dir:
                 cam_front_centered_gs = copy.copy(gs)
                 tmp = torch.cat([gs._means, torch.ones((gs._means.shape[0], 1), device=gs._means.device)], dim=-1) @ self.world_to_camera_front.T

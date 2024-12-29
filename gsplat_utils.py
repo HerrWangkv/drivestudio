@@ -229,7 +229,14 @@ class Gaussian:
     @property
     def quats(self):
         return self._quats.detach().cpu().numpy()
-    
+    def concat(self, other):
+        self._means = torch.cat((self._means, other._means), dim=0)
+        self._features_dc = torch.cat((self._features_dc, other._features_dc), dim=0)
+        # self._features_rest = torch.cat((self._features_rest, other._features_rest), dim=0)
+        self._opacities = torch.cat((self._opacities, other._opacities), dim=0)
+        self._scales = torch.cat((self._scales, other._scales), dim=0)
+        self._quats = torch.cat((self._quats, other._quats), dim=0)
+        
     def __len__(self):
         assert self._means.shape[0] == self._features_dc.shape[0] == self._opacities.shape[0] == self._scales.shape[0] == self._quats.shape[0]# == self._features_rest.shape[0]
         return self._means.shape[0]
