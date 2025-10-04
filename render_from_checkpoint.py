@@ -115,6 +115,7 @@ class Dataset:
 
     def get_boxes_in_camera_front(self, frame_idx):
         boxes = []
+        model_types = []
         for obj_idx in range(self.instance_num):
             obj_to_cam_front = np.array(
                 self.pixel_source.instances_pose[frame_idx][obj_idx]
@@ -138,7 +139,8 @@ class Dataset:
                 obj_corners @ obj_to_cam_front[:3, :3].T + obj_to_cam_front[:3, 3]
             )
             boxes.append(obj_corners_in_cam_front)
-        return boxes
+            model_types.append(int(self.pixel_source.instances_model_types[obj_idx]))
+        return boxes, model_types
 
 
 class Model:
@@ -339,7 +341,7 @@ class Model:
         #     self.gs._means = gs_in_cam_front
 
     def remove_objects(self, frame_idx):
-        boxes = self.dataset.get_boxes_in_camera_front(frame_idx)
+        boxes, types = self.dataset.get_boxes_in_camera_front(frame_idx)
         mask = torch.ones(
             len(self.gs._means), dtype=torch.bool, device=self.gs._means.device
         )
@@ -565,6 +567,8 @@ class Model:
                 self.collect_gaussians()
             if add_splats_dir is not None:
                 add_splats_path = os.path.join(add_splats_dir, f"frame_{frame:04d}.pt")
+                if not os.path.exists(add_splats_path):
+                    continue
                 added_gs = torch.load(add_splats_path)
 
                 def inverse_sigmoid(x, eps=1e-6):
